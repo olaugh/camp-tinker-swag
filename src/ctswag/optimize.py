@@ -210,31 +210,28 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
     # Build a set of candidate baselines to try.
     candidate_baselines: list[Baseline] = []
     if dt.baseline is not None and dt.baseline.kind == "arc":
+        # The merger / baseline fit gave us a real arc -- trust it,
+        # don't synthesize alternates that might displace the text.
         candidate_baselines.append(dt.baseline)
-    if dt.baseline is None or dt.baseline.kind == "line" or try_arc_for_line:
-        # Hypothesis: text follows an arc concentric with the badge (i.e.
-        # arc centers are above/below the polygon centroid). Try a few
-        # radii. For straight text in the original (radius=inf), only the
-        # initial line fit will be kept by the sweep; the arcs just give
-        # us a chance to detect when "2025" actually curves.
-        cx_p = float(dt.polygon[:, 0].mean())
-        cy_p = float(dt.polygon[:, 1].mean())
-        text_w = float(dt.polygon[:, 0].max() - dt.polygon[:, 0].min())
-        # Chord-and-sagitta: try arcs whose center is above the polygon at
-        # distances ranging from 2x text_w (heavy curve) to 12x text_w
-        # (nearly flat). Center BELOW (concave-down text) is unusual for
-        # badge designs so we skip it -- saves half the sweep budget.
-        for k in (1.5, 2.5, 4.0, 8.0):
-            cy_arc = cy_p + k * text_w / 2   # arc center BELOW polygon
-            r_arc = abs(cy_arc - cy_p)
-            candidate_baselines.append(
-                Baseline(kind="arc",
-                         params=(cx_p, cy_arc, r_arc, 0.0, 0.0),
-                         residual=0.0)
-            )
-        # Also include the original line baseline.
-        if dt.baseline is not None and dt.baseline.kind == "line":
+    elif dt.baseline is None or dt.baseline.kind == "line":
+        if dt.baseline is not None:
             candidate_baselines.append(dt.baseline)
+        if try_arc_for_line:
+            # Hypothesis: short straight-looking text (e.g. "2025") might
+            # actually follow a wide arc concentric with the badge. Synth a
+            # few candidate radii. Arc center is BELOW the polygon so text
+            # is concave-up (like a smile -- the badge convention).
+            cx_p = float(dt.polygon[:, 0].mean())
+            cy_p = float(dt.polygon[:, 1].mean())
+            text_w = float(dt.polygon[:, 0].max() - dt.polygon[:, 0].min())
+            for k in (1.5, 2.5, 4.0, 8.0):
+                cy_arc = cy_p + k * text_w / 2
+                r_arc = abs(cy_arc - cy_p)
+                candidate_baselines.append(
+                    Baseline(kind="arc",
+                             params=(cx_p, cy_arc, r_arc, 0.0, 0.0),
+                             residual=0.0)
+                )
 
     text = dt.text or ""
 
@@ -296,7 +293,22 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
                   letter_spacing_em=params["ls_px"] / max(params["size_px"], 1.0),
                   dx=params["dx"], dy=params["dy"],
                   score=final_score)
-    # If the sweep found a better baseline than dt's, return it so the
-    # caller can attach it to the DetectedText before assembly.
+    # If the chosen baseline is a synthesized arc (t0==t1==0), refill its
+    # angular extent from the chosen font's actual rendered width so the
+    # assembler can draw a non-degenerate path.
     new_baseline = baseline if baseline is not dt.baseline else None
+    if new_baseline is not None and new_baseline.kind == "arc":
+        cx, cy, r, t0, t1 = new_baseline.params
+        if t0 == 0.0 and t1 == 0.0:
+            font = ImageFont.truetype(fm.ttf_path,
+                                      max(int(round(params["size_px"])), 8))
+            _chars, total_w, _, _ = _measure_run(text, font, params["ls_px"])
+            total_dtheta = total_w / max(r, 1.0)
+            # Centered on the top of the circle (-pi/2). Apply dx along the arc.
+            center_theta = -math.pi / 2 + params["dx"] / max(r, 1.0)
+            new_t0 = center_theta - total_dtheta / 2
+            new_t1 = center_theta + total_dtheta / 2
+            new_baseline = Baseline(kind="arc",
+                                    params=(cx, cy, r, float(new_t0), float(new_t1)),
+                                    residual=new_baseline.residual)
     return out, params, new_baseline
