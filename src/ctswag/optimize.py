@@ -355,8 +355,11 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
                   dx=params["dx"], dy=params["dy"],
                   score=final_score)
     # If the chosen baseline is a synthesized arc (t0==t1==0), refill its
-    # angular extent from the chosen font's actual rendered width so the
-    # assembler can draw a non-degenerate path.
+    # angular extent so the SVG <textPath> has room for the text PLUS some
+    # margin for startOffset-based dx shifts. The path is centered on
+    # -pi/2 (top of arc); dx is applied later by the assembler via
+    # startOffset = 50% + (dx / arc_len) * 100%. We must NOT bake dx into
+    # t0/t1 here or it would be applied twice.
     new_baseline = baseline if baseline is not dt.baseline else None
     if new_baseline is not None and new_baseline.kind == "arc":
         cx, cy, r, t0, t1 = new_baseline.params
@@ -364,11 +367,13 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
             font = ImageFont.truetype(fm.ttf_path,
                                       max(int(round(params["size_px"])), 8))
             _chars, total_w, _, _ = _measure_run(text, font, params["ls_px"])
-            total_dtheta = total_w / max(r, 1.0)
-            # Centered on the top of the circle (-pi/2). Apply dx along the arc.
-            center_theta = -math.pi / 2 + params["dx"] / max(r, 1.0)
-            new_t0 = center_theta - total_dtheta / 2
-            new_t1 = center_theta + total_dtheta / 2
+            text_angle = total_w / max(r, 1.0)
+            # Path extent = 2x text width angularly. Gives startOffset room
+            # to shift +/- 50% of text width via dx without the text falling
+            # off the arc.
+            path_angle = text_angle * 2.0
+            new_t0 = -math.pi / 2 - path_angle / 2
+            new_t1 = -math.pi / 2 + path_angle / 2
             new_baseline = Baseline(kind="arc",
                                     params=(cx, cy, r, float(new_t0), float(new_t1)),
                                     residual=new_baseline.residual)
