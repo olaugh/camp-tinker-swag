@@ -6,6 +6,8 @@ import math
 import numpy as np
 from skimage.measure import CircleModel
 
+from .types import Baseline
+
 
 def _polygon_centerline(poly: np.ndarray) -> np.ndarray:
     pts = np.asarray(poly, dtype=np.float64)
@@ -62,7 +64,8 @@ def merge_arc(polygons: list[np.ndarray], texts: list[str],
 
 def maybe_merge(polygons: list[np.ndarray], texts: list[str],
                 *, residual_threshold: float = 8.0,
-                max_gap_deg: float = 45.0) -> list[tuple[np.ndarray, str]]:
+                max_gap_deg: float = 45.0
+                ) -> list[tuple[np.ndarray, str, Baseline | None]]:
     """Cluster polygons into arc-sharing groups; merge each group.
 
     Two polygons can only be merged if (a) all polygons in the group fit a
@@ -74,7 +77,9 @@ def maybe_merge(polygons: list[np.ndarray], texts: list[str],
     grow that group as long as adding a polygon keeps residual < threshold,
     repeat with the leftovers. Singletons are returned as-is.
     """
-    items = [(p, t) for p, t in zip(polygons, texts)]
+    items: list[tuple[np.ndarray, str, Baseline | None]] = [
+        (p, t, None) for p, t in zip(polygons, texts)
+    ]
     if len(items) < 2:
         return items
 
@@ -112,7 +117,7 @@ def maybe_merge(polygons: list[np.ndarray], texts: list[str],
             return float("inf"), 0.0
 
     remaining = list(range(len(items)))
-    out: list[tuple[np.ndarray, str]] = []
+    out: list[tuple[np.ndarray, str, Baseline | None]] = []
     while remaining:
         # Find best-pair to start a group; if no pair fits, dump remaining as singletons.
         best_pair = None
@@ -128,6 +133,8 @@ def maybe_merge(polygons: list[np.ndarray], texts: list[str],
             for i in remaining:
                 out.append(items[i])
             break
+        # If best_pair came back inf earlier and we got here, the residual
+        # check above will catch it.
         group = list(best_pair)
         # Greedily extend group.
         leftover = [k for k in remaining if k not in group]
@@ -150,11 +157,25 @@ def maybe_merge(polygons: list[np.ndarray], texts: list[str],
         texts_g = [items[g][1] for g in group]
         all_pts = np.vstack([_polygon_centerline(p) for p in polys])
         cm = CircleModel.from_estimate(all_pts)
-        cx, cy = cm.center
+        cx, cy = float(cm.center[0]), float(cm.center[1])
+        r = float(cm.radius)
         angles = [math.atan2(p.mean(axis=0)[1] - cy, p.mean(axis=0)[0] - cx) for p in polys]
         order = np.argsort(angles)
         merged_poly = np.vstack([polys[i] for i in order])
         joined_text = " ".join(texts_g[i] for i in order if texts_g[i])
-        out.append((merged_poly, joined_text))
+        # Build an explicit Baseline from the group's full angular extent.
+        all_angles = [
+            math.atan2(p[:, 1].mean() - cy, p[:, 0].mean() - cx)
+            for p in polys
+        ]
+        merged_pts = merged_poly  # all corners
+        all_thetas = np.arctan2(merged_pts[:, 1] - cy, merged_pts[:, 0] - cx)
+        t0 = float(all_thetas.min())
+        t1 = float(all_thetas.max())
+        # Re-derive residual on the merged polygon (worst per polygon).
+        worst_resid, _ = arc_residual(polys)
+        baseline = Baseline(kind="arc", params=(cx, cy, r, t0, t1),
+                            residual=float(worst_resid))
+        out.append((merged_poly, joined_text, baseline))
         remaining = leftover
     return out

@@ -101,11 +101,14 @@ def run(input_path: Path | str,
         clean = "".join(c for c in text if c.isalnum() or c.isspace()).strip().upper()
         pre_texts.append(clean)
         pre_polys.append(poly)
-    merged = merge_mod.maybe_merge(pre_polys, pre_texts)
+    # Scale arc-residual threshold to image size: 1% of the short edge.
+    short_edge = float(min(H, W))
+    merged = merge_mod.maybe_merge(pre_polys, pre_texts,
+                                   residual_threshold=max(8.0, 0.01 * short_edge))
 
     texts: list[DetectedText] = []
-    for poly, joined_text in merged:
-        bl = baseline_mod.fit(poly)
+    for poly, joined_text, merged_baseline in merged:
+        bl = merged_baseline if merged_baseline is not None else baseline_mod.fit(poly)
         if bl.kind == "arc":
             crop = unwarp_mod.unwarp_arc(img_bgr, poly, bl)
         else:
@@ -138,15 +141,29 @@ def run(input_path: Path | str,
         candidates = fontid_mod.match(gray, dt.text, corpus, top_k=cfg.top_k_fonts)
         best = candidates[0] if candidates else FontMatch(family="sans-serif", weight=700)
         # Re-record a sensible size for assembly.
-        # For arched text the polygon's y-extent includes arc sag; use the
-        # unwarped strip height instead. For straight text use the polygon h.
+        # The polygon's y-extent is wrong for both arched (arc sag) and tilted
+        # rectangles (rotated, axis-aligned bbox is huge). Use:
+        #  - unwarped-strip height for arc baselines
+        #  - rotated minAreaRect short side for line baselines
         if dt.baseline and dt.baseline.kind == "arc":
-            phys_h = float(dt.crop.shape[0])
+            # Measure actual ink height inside the unwarped strip rather than
+            # trusting the strip height (the polygon may have padded the
+            # radial extent beyond the glyphs).
+            gray_strip = cv2.cvtColor(dt.crop, cv2.COLOR_BGR2GRAY)
+            ink = (gray_strip < 128)
+            if ink.any():
+                row_has_ink = ink.any(axis=1)
+                ys = np.where(row_has_ink)[0]
+                phys_h = float(ys.max() - ys.min() + 1)
+            else:
+                phys_h = float(dt.crop.shape[0])
         else:
-            phys_h = float(dt.polygon[:, 1].max() - dt.polygon[:, 1].min())
+            rect = cv2.minAreaRect(dt.polygon.astype(np.float32))
+            w_rr, h_rr = rect[1]
+            phys_h = float(min(w_rr, h_rr))
         best_dict = best.__dict__.copy()
-        # font-size for SVG text usually >= ink height; bump slightly for cap-letters.
-        best_dict["size_px"] = phys_h * 1.4
+        # font-size ≈ cap-height / 0.72 for typical sans-serif fonts.
+        best_dict["size_px"] = phys_h / 0.72
         matches.append(FontMatch(**best_dict))
     timings["fontid"] = time.perf_counter() - t0
     out.font_matches = matches
