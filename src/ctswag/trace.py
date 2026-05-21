@@ -81,18 +81,16 @@ def trace_potrace(img_bgr: np.ndarray, *, turdsize: int = 4, alphamax: float = 1
     paths = []
     for curve in path:
         d = []
-        start_x, start_y = curve.start_point
-        d.append(f"M {start_x:.2f} {start_y:.2f}")
+        sp = curve.start_point
+        d.append(f"M {sp.x:.2f} {sp.y:.2f}")
         for seg in curve.segments:
             if seg.is_corner:
-                cx, cy = seg.c
-                ex, ey = seg.end_point
-                d.append(f"L {cx:.2f} {cy:.2f} L {ex:.2f} {ey:.2f}")
+                c = seg.c
+                e = seg.end_point
+                d.append(f"L {c.x:.2f} {c.y:.2f} L {e.x:.2f} {e.y:.2f}")
             else:
-                c1x, c1y = seg.c1
-                c2x, c2y = seg.c2
-                ex, ey = seg.end_point
-                d.append(f"C {c1x:.2f} {c1y:.2f} {c2x:.2f} {c2y:.2f} {ex:.2f} {ey:.2f}")
+                c1 = seg.c1; c2 = seg.c2; e = seg.end_point
+                d.append(f"C {c1.x:.2f} {c1.y:.2f} {c2.x:.2f} {c2.y:.2f} {e.x:.2f} {e.y:.2f}")
         d.append("Z")
         paths.append(f'<path d="{" ".join(d)}" fill="black"/>')
     return TraceResult(svg_paths=paths, width=W, height=H)

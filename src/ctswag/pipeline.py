@@ -13,6 +13,7 @@ from . import baseline as baseline_mod
 from . import detect as detect_mod
 from . import fontid as fontid_mod
 from . import inpaint as inpaint_mod
+from . import merge as merge_mod
 from . import recognize as recognize_mod
 from . import trace as trace_mod
 from . import unwarp as unwarp_mod
@@ -84,19 +85,42 @@ def run(input_path: Path | str,
     # 2. recognize + baseline + crop, per polygon
     t0 = time.perf_counter()
     rec_fn = recognize_mod.REGISTRY[cfg.recognizer]
-    texts: list[DetectedText] = []
+    # First do a preliminary recognition pass to get text per polygon, so the
+    # arc merger has labels to splice in left-to-right order.
+    pre_texts: list[str] = []
+    pre_polys: list[np.ndarray] = []
     for poly in polygons:
         bl = baseline_mod.fit(poly)
-        # Unwarp arched text BEFORE recognition; straight text just gets cropped.
         if bl.kind == "arc":
             crop = unwarp_mod.unwarp_arc(img_bgr, poly, bl)
         else:
             crop = _crop_polygon(img_bgr, poly, height_mul=cfg.text_height_factor)
         if crop.size == 0:
             continue
-        text, conf = rec_fn(crop[:, :, ::-1])
+        text, _ = rec_fn(crop[:, :, ::-1])
         clean = "".join(c for c in text if c.isalnum() or c.isspace()).strip().upper()
-        dt = DetectedText(polygon=poly, text=clean, confidence=conf,
+        pre_texts.append(clean)
+        pre_polys.append(poly)
+    merged = merge_mod.maybe_merge(pre_polys, pre_texts)
+
+    texts: list[DetectedText] = []
+    for poly, joined_text in merged:
+        bl = baseline_mod.fit(poly)
+        if bl.kind == "arc":
+            crop = unwarp_mod.unwarp_arc(img_bgr, poly, bl)
+        else:
+            crop = _crop_polygon(img_bgr, poly, height_mul=cfg.text_height_factor)
+        if crop.size == 0:
+            continue
+        # If joined_text came out empty (because pre-pass found nothing on a
+        # raw curved crop), re-run recognition on the unwarped joined crop.
+        if not joined_text:
+            text, conf = rec_fn(crop[:, :, ::-1])
+            joined_text = "".join(c for c in text if c.isalnum() or c.isspace()).strip().upper()
+            confidence = float(conf)
+        else:
+            confidence = 0.9
+        dt = DetectedText(polygon=poly, text=joined_text, confidence=confidence,
                           baseline=bl, crop=crop)
         texts.append(dt)
     timings["recognize+baseline"] = time.perf_counter() - t0

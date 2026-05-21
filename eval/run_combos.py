@@ -158,25 +158,47 @@ def main():
         # copy the SVG into the run dir for convenience
         (run_dir / "output.svg").write_bytes(out_svg.read_bytes())
 
+        # Completeness vs ground truth (when available from badge)
+        expected_set: set[str] = set()
+        if badge is not None:
+            expected_set = {badge.title_text.upper(), badge.year_text.upper()}
+        found_set = {t.text.upper() for t in res.texts if t.text}
+        # split arched text "CAMP TINKER" into its words for forgiving comparison
+        found_words = {w for s in found_set for w in s.split()}
+        expected_words = {w for s in expected_set for w in s.split()}
+        completeness = (len(found_words & expected_words) / max(len(expected_words), 1)
+                        if expected_words else None)
+
         row = {
             "name": name, "wall_s": wall,
             "ssim": m_all["ssim"], "l1_255": m_all["l1_255"],
             "ssim_text": m_txt["ssim"] if m_txt else None,
             "l1_255_text": m_txt["l1_255"] if m_txt else None,
+            "completeness": completeness,
             "texts": [t.text for t in res.texts],
             "fonts": [(fm.family, fm.weight, round(fm.score, 4))
                       for fm in res.font_matches],
+            "timings": res.timings,
         }
         leaderboard.append(row)
-        print(f"  wall {wall:.1f}s  ssim {m_all['ssim']:.3f}  L1 {m_all['l1_255']:.2f}/255")
+        print(f"  wall {wall:.1f}s  ssim {m_all['ssim']:.3f}  L1 {m_all['l1_255']:.2f}/255"
+              + (f"  complete {completeness:.0%}" if completeness is not None else ""))
         print(f"  texts: {row['texts']}  fonts: {row['fonts']}")
 
-    leaderboard.sort(key=lambda r: -r["ssim"])
-    (args.out / "leaderboard.json").write_text(json.dumps(leaderboard, indent=2))
+    # Rank by (completeness desc, ssim desc): completeness is the gating criterion
+    # for an editable-text deliverable; SSIM is the tiebreaker.
+    def sort_key(r):
+        c = r.get("completeness")
+        return (-(c if c is not None else -1), -r["ssim"])
+    leaderboard.sort(key=sort_key)
+    (args.out / "leaderboard.json").write_text(json.dumps(leaderboard, indent=2, default=str))
     print(f"\nleaderboard ({len(leaderboard)} entries) -> {args.out}/leaderboard.json")
-    print(f"{'NAME':<50} {'SSIM':>6} {'L1/255':>7} {'WALL_S':>7}")
-    for row in leaderboard[:10]:
-        print(f"{row['name']:<50} {row['ssim']:>6.3f} {row['l1_255']:>7.2f} {row['wall_s']:>7.1f}")
+    hdr = f"{'NAME':<50} {'COMP':>5} {'SSIM':>6} {'L1/255':>7} {'WALL_S':>7}"
+    print(hdr)
+    for row in leaderboard:
+        c = row.get("completeness")
+        cs = f"{c:>5.0%}" if c is not None else "  n/a"
+        print(f"{row['name']:<50} {cs} {row['ssim']:>6.3f} {row['l1_255']:>7.2f} {row['wall_s']:>7.1f}")
 
 
 if __name__ == "__main__":
