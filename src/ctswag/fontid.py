@@ -111,64 +111,102 @@ def _resize_to(img: np.ndarray, h: int, w: int) -> np.ndarray:
 
 
 def _score(rendered: np.ndarray, source: np.ndarray) -> tuple[float, float, float]:
-    """Returns (composite, l1, ssim_val). Both inputs are grayscale uint8, same size."""
-    r = rendered.astype(np.float32) / 255.0
-    s = source.astype(np.float32) / 255.0
-    l1 = float(np.mean(np.abs(r - s)))
+    """Returns (composite, l1, ssim_val).
+
+    Scores on the BINARIZED ink mask rather than the grayscale image to avoid
+    being dominated by anti-aliasing differences between cairosvg and Pillow.
+    A small Gaussian blur is applied before binarising so single-pixel
+    misalignments don't cause maximum-distance penalties.
+    """
+    import cv2
+    # Blur slightly to forgive sub-pixel jitter
+    r = cv2.GaussianBlur(rendered, (3, 3), 0.7)
+    s = cv2.GaussianBlur(source, (3, 3), 0.7)
+    rb = (r < 160).astype(np.float32)
+    sb = (s < 160).astype(np.float32)
+    l1 = float(np.mean(np.abs(rb - sb)))
     try:
-        v = float(ssim(r, s, data_range=1.0))
+        v = float(ssim(rb, sb, data_range=1.0))
     except Exception:
         v = 0.0
     composite = 0.5 * l1 + 0.5 * (1.0 - v)
     return composite, l1, v
 
 
+def _score_one(args: tuple) -> tuple[FontMatch, float, float, float, float]:
+    """Worker for the parallel match() call. Returns (fm, composite, l1, ssim, ls)."""
+    fm, text, src_norm, working_h, spacings = args
+    src_h, src_w = src_norm.shape
+    best_composite, best_l1, best_ssim, best_ls = float("inf"), float("inf"), 0.0, 0.0
+    for ls in spacings:
+        try:
+            rendered = _render_string(text, fm.ttf_path, target_h=working_h,
+                                      letter_spacing_px=ls)
+            rendered = _crop_text(rendered)
+            rendered_norm = _resize_to(rendered, src_h, src_w)
+            composite, l1, v = _score(rendered_norm, src_norm)
+            width_penalty = abs(rendered.shape[1] - src_w) / max(src_w, 1)
+            composite = composite + 0.05 * width_penalty
+            if composite < best_composite:
+                best_composite, best_l1, best_ssim, best_ls = composite, l1, v, ls
+        except Exception:
+            continue
+    return fm, best_composite, best_l1, best_ssim, best_ls
+
+
 def match(crop_gray: np.ndarray, text: str,
           corpus: Iterable[FontMatch],
           *, top_k: int = 5,
           working_h: int = 128,
-          spacings_px: tuple[float, ...] = (0, 2, 4, 6, 8, 10, 12)) -> list[FontMatch]:
+          spacings_px: tuple[float, ...] = (0, 2, 4, 6, 8, 10, 12),
+          coarse_k: int = 80,
+          workers: int | None = None) -> list[FontMatch]:
     """Score every (font, weight) on a tight text crop.
 
-    Renders each candidate at `working_h` px tall with several letter-spacings
-    and picks the BEST spacing per candidate. Then ranks candidates by their
-    best-spacing score (composite of L1 + (1-SSIM)).
+    For large corpora a two-stage pass is used:
+      1. Coarse pass: render each candidate with letter_spacing=0 only, rank.
+      2. Fine pass: for the top `coarse_k` candidates, sweep letter-spacing.
+
+    Workers default to os.cpu_count().
     """
+    import os
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
     src = _crop_text(crop_gray)
     if src.size == 0:
         return list(corpus)[:top_k]
     src_h, src_w = src.shape
-    # Normalise source to a fixed working height; width preserves aspect.
-    src_aspect = src_w / max(src_h, 1)
-    norm_w_target = int(working_h * src_aspect)
-    src_norm = _resize_to(src, working_h, max(norm_w_target, 16))
-    src_norm_h, src_norm_w = src_norm.shape
-    scored: list[FontMatch] = []
-    for fm in corpus:
-        best_composite, best_l1, best_ssim, best_ls = float("inf"), float("inf"), 0.0, 0.0
-        for ls in spacings_px:
-            try:
-                rendered = _render_string(text, fm.ttf_path, target_h=working_h,
-                                          letter_spacing_px=ls)
-                rendered = _crop_text(rendered)
-                # If rendered is wider than src_norm, the candidate has too much spacing.
-                # If narrower, too little. Score after force-resizing to source dims.
-                rendered_norm = _resize_to(rendered, src_norm_h, src_norm_w)
-                composite, l1, v = _score(rendered_norm, src_norm)
-                # Penalise wide aspect mismatch: prefer candidates whose natural
-                # rendered width is close to src_norm_w.
-                width_penalty = abs(rendered.shape[1] - src_norm_w) / max(src_norm_w, 1)
-                composite_with_penalty = composite + 0.05 * width_penalty
-                if composite_with_penalty < best_composite:
-                    best_composite, best_l1, best_ssim, best_ls = (
-                        composite_with_penalty, l1, v, ls
-                    )
-            except Exception:
-                continue
-        scored.append(replace(fm, score=best_composite, l1=best_l1, ssim=best_ssim,
-                              size_px=float(src_h), letter_spacing_em=best_ls / max(working_h, 1)))
-    scored.sort(key=lambda fm: fm.score)
-    return scored[:top_k]
+    aspect = src_w / max(src_h, 1)
+    norm_w = max(int(working_h * aspect), 16)
+    src_norm = _resize_to(src, working_h, norm_w)
+    corpus_list = list(corpus)
+    if not corpus_list:
+        return []
+
+    workers = workers or min(os.cpu_count() or 4, 8)
+
+    def run(items: list[FontMatch], spacings: tuple[float, ...]) -> list[FontMatch]:
+        # ThreadPoolExecutor is fine because the per-item work is mostly
+        # I/O-bound (file reads) + Pillow rasterization which releases the GIL.
+        out: list[FontMatch] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            args_iter = [(fm, text, src_norm, working_h, spacings) for fm in items]
+            for fm, comp, l1, v, ls in ex.map(_score_one, args_iter):
+                out.append(replace(fm, score=comp, l1=l1, ssim=v,
+                                   size_px=float(src_h),
+                                   letter_spacing_em=ls / max(working_h, 1)))
+        out.sort(key=lambda fm: fm.score)
+        return out
+
+    # Stage 1: coarse pass (single spacing)
+    if len(corpus_list) > coarse_k:
+        coarse = run(corpus_list, spacings=(0.0,))
+        finalists = coarse[:coarse_k]
+    else:
+        finalists = corpus_list
+    # Stage 2: fine pass over finalists with full spacing sweep
+    fine = run(finalists, spacings=spacings_px)
+    return fine[:top_k]
 
 
 def render_glyph_sheet(text: str, fm: FontMatch, *, target_h: int = 120) -> np.ndarray:
