@@ -221,9 +221,11 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
         return candidates[0], {}, None
 
     initial_size = candidates[0].size_px if candidates[0].size_px else 64.0
-    size_range = (initial_size * 0.75, initial_size * 1.30)
+    # Tightened so the search can't pick a font 30% taller than the source
+    # by relying on letter-spacing to fill the width.
+    size_range = (initial_size * 0.80, initial_size * 1.10)
     sizes = np.linspace(size_range[0], size_range[1], n_size)
-    lss = np.linspace(0, initial_size * 0.15, n_ls)
+    lss = np.linspace(0, initial_size * 0.12, n_ls)
 
     # Build a set of candidate baselines to try.
     candidate_baselines: list[Baseline] = []

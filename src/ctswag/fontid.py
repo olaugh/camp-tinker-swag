@@ -117,35 +117,38 @@ def _resize_to(img: np.ndarray, h: int, w: int) -> np.ndarray:
 
 
 def _score(rendered: np.ndarray, source: np.ndarray) -> tuple[float, float, float]:
-    """Symmetric chamfer distance between the binarized ink masks.
+    """Symmetric chamfer distance + IoU complement.
 
-    Returns (composite, l1, ssim_val). The L1 and SSIM components are kept
-    for diagnostic purposes; `composite` is the chamfer distance NORMALISED
-    by image height (so 0.1 == ~10% of the height) and is what the
-    ranker / optimizer minimise.
+    Chamfer alone can be fooled: a font with scattered ink (e.g. Handjet,
+    a pixelated dot-matrix face) lands ink near the source's ink even
+    when the glyph shape is completely wrong. We add (1 - IoU) of the
+    binarized masks so the loss also penalizes "ink we have where the
+    source doesn't" and "ink the source has where we don't".
+
+    Returns (composite, l1, ssim_val). Composite weights chamfer and
+    IoU equally after each is normalised to roughly [0, 1].
     """
     import cv2
     if rendered.size == 0 or source.size == 0:
         return float("inf"), float("inf"), 0.0
-    # binarize
     rb = (rendered < 160).astype(np.uint8)
     sb = (source   < 160).astype(np.uint8)
     if rb.sum() == 0 or sb.sum() == 0:
         return float("inf"), float("inf"), 0.0
-    # distanceTransform: zero pixels are obstacles, returns distance from each
-    # non-zero pixel to the nearest zero pixel. We invert ink so we get the
-    # distance from background to nearest ink.
+    # Chamfer (both directions, mean L2 ink-to-ink distance).
     r_dist = cv2.distanceTransform(1 - rb, cv2.DIST_L2, 3)
     s_dist = cv2.distanceTransform(1 - sb, cv2.DIST_L2, 3)
-    # Asymmetric: how far is the source's ink from the nearest rendered ink?
     n_s = float(sb.sum())
     n_r = float(rb.sum())
     d_sr = float((sb * r_dist).sum()) / max(n_s, 1.0)
     d_rs = float((rb * s_dist).sum()) / max(n_r, 1.0)
     chamfer = 0.5 * (d_sr + d_rs)
-    # Normalise to be roughly scale-invariant.
-    composite = chamfer / max(rendered.shape[0], 1)
-    # Diagnostic SSIM / L1 (computed on the binary masks).
+    chamfer_norm = chamfer / max(rendered.shape[0], 1)
+    # IoU on the binarised masks.
+    intersection = float(np.logical_and(rb, sb).sum())
+    union = float(np.logical_or(rb, sb).sum())
+    iou = intersection / max(union, 1.0)
+    composite = 0.5 * chamfer_norm + 0.5 * (1.0 - iou)
     l1 = float(np.mean(np.abs(rb.astype(np.float32) - sb.astype(np.float32))))
     try:
         v = float(ssim(rb.astype(np.float32), sb.astype(np.float32), data_range=1.0))
