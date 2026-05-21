@@ -217,16 +217,25 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
     elif dt.baseline is None or dt.baseline.kind == "line":
         if dt.baseline is not None and not force_arc:
             candidate_baselines.append(dt.baseline)
+        cx_p = float(dt.polygon[:, 0].mean())
+        cy_p = float(dt.polygon[:, 1].mean())
+        text_w = float(dt.polygon[:, 0].max() - dt.polygon[:, 0].min())
+        if arc_centers_hint:
+            # The caller gave us known arc centers (e.g. the badge's). Sweep
+            # only the radius from that center to the polygon centroid, +-
+            # a small offset, so the arc stays concentric with the badge.
+            for hcx, hcy in arc_centers_hint:
+                r_baseline = float(np.hypot(cx_p - hcx, cy_p - hcy))
+                for r_mult in (0.85, 0.92, 1.0, 1.08, 1.15):
+                    r_arc = r_baseline * r_mult
+                    candidate_baselines.append(
+                        Baseline(kind="arc",
+                                 params=(float(hcx), float(hcy), r_arc, 0.0, 0.0),
+                                 residual=0.0)
+                    )
         if try_arc_for_line or force_arc:
-            # Hypothesis: short straight-looking text (e.g. "2025") might
-            # actually follow a wide arc concentric with the badge. Synth a
-            # few candidate radii. Arc center is BELOW the polygon so text
-            # is concave-up (like a smile -- the badge convention).
-            cx_p = float(dt.polygon[:, 0].mean())
-            cy_p = float(dt.polygon[:, 1].mean())
-            text_w = float(dt.polygon[:, 0].max() - dt.polygon[:, 0].min())
-            # Expanded radii range when force_arc is set, to give the sweep
-            # more flexibility.
+            # Fallback: synth a few candidate concave-up arcs whose center
+            # sits below the polygon. Used when no badge hint is available.
             ks = (1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0) if force_arc else (1.5, 2.5, 4.0, 8.0)
             for k in ks:
                 cy_arc = cy_p + k * text_w / 2

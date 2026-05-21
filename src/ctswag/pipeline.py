@@ -12,6 +12,7 @@ import numpy as np
 from . import baseline as baseline_mod
 from . import detect as detect_mod
 from . import fontid as fontid_mod
+from . import geom as geom_mod
 from . import inpaint as inpaint_mod
 from . import merge as merge_mod
 from . import optimize as optimize_mod
@@ -208,6 +209,14 @@ def run(input_path: Path | str,
     # 3b. local sweep over (size, ls, dy=arc-radius-shift, dx, candidate baseline)
     if cfg.refine:
         t0 = time.perf_counter()
+        # Try to locate the badge's center so synthesised arc baselines stay
+        # concentric with the rings (especially important for the year text,
+        # which is on a wide arc around the same center as CAMP TINKER).
+        badge = geom_mod.find_badge_center(img_bgr)
+        hint = [(badge[0], badge[1])] if badge else None
+        if badge:
+            out.timings["badge_center"] = 0.0
+            out.config["badge_center"] = {"cx": badge[0], "cy": badge[1], "r": badge[2]}
         refined: list[FontMatch] = []
         for dt, fm, cands in zip(texts, matches, candidates_per_text):
             if not cands or not dt.text:
@@ -221,6 +230,7 @@ def run(input_path: Path | str,
                 dt, seeded, img_bgr,
                 try_arc_for_line=cfg.refine_try_arc,
                 force_arc=cfg.refine_force_arc,
+                arc_centers_hint=hint,
             )
             refined.append(best_fm)
             if new_baseline is not None:
