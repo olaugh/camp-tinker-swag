@@ -184,6 +184,7 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
           *, n_size: int = 5, n_dy: int = 5, n_ls: int = 3,
           n_dx: int = 5,
           try_arc_for_line: bool = True,
+          force_arc: bool = False,
           arc_centers_hint: list[tuple[float, float]] | None = None,
           ) -> tuple[FontMatch, dict, Baseline | None]:
     """Run a coordinate-descent grid sweep on each candidate font and
@@ -214,9 +215,9 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
         # don't synthesize alternates that might displace the text.
         candidate_baselines.append(dt.baseline)
     elif dt.baseline is None or dt.baseline.kind == "line":
-        if dt.baseline is not None:
+        if dt.baseline is not None and not force_arc:
             candidate_baselines.append(dt.baseline)
-        if try_arc_for_line:
+        if try_arc_for_line or force_arc:
             # Hypothesis: short straight-looking text (e.g. "2025") might
             # actually follow a wide arc concentric with the badge. Synth a
             # few candidate radii. Arc center is BELOW the polygon so text
@@ -224,7 +225,10 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
             cx_p = float(dt.polygon[:, 0].mean())
             cy_p = float(dt.polygon[:, 1].mean())
             text_w = float(dt.polygon[:, 0].max() - dt.polygon[:, 0].min())
-            for k in (1.5, 2.5, 4.0, 8.0):
+            # Expanded radii range when force_arc is set, to give the sweep
+            # more flexibility.
+            ks = (1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0) if force_arc else (1.5, 2.5, 4.0, 8.0)
+            for k in ks:
                 cy_arc = cy_p + k * text_w / 2
                 r_arc = abs(cy_arc - cy_p)
                 candidate_baselines.append(

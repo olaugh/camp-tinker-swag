@@ -36,6 +36,7 @@ class PipelineConfig:
     refine: bool = True               # Run optimize.sweep on top-K finalists
     refine_top_k: int = 6             # How many finalists to keep into the sweep
     refine_try_arc: bool = True       # For "line" baselines, also sweep arc radii
+    refine_force_arc: bool = False    # Force every text to use an arc baseline
     corpus_min_weight: int = 0        # Drop TTFs lighter than this (700=bold)
     # If provided, skip OCR entirely and assign these strings to detected
     # polygons in top-to-bottom order. Same length as expected polygon count.
@@ -219,6 +220,7 @@ def run(input_path: Path | str,
             best_fm, params, new_baseline = optimize_mod.sweep(
                 dt, seeded, img_bgr,
                 try_arc_for_line=cfg.refine_try_arc,
+                force_arc=cfg.refine_force_arc,
             )
             refined.append(best_fm)
             if new_baseline is not None:

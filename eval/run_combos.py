@@ -88,6 +88,8 @@ def main():
                    help="Drop TTFs below this weight from the corpus.")
     p.add_argument("--text", nargs="+", default=None,
                    help="Override OCR with fixed text strings, assigned top-to-bottom.")
+    p.add_argument("--force-arc", action="store_true",
+                   help="Force every detected text to use an arc baseline.")
     args = p.parse_args()
 
     badge = None
@@ -135,6 +137,7 @@ def main():
             font_corpus_dir=str(args.fonts), top_k_fonts=args.top_k_fonts,
             corpus_min_weight=args.corpus_min_weight,
             text_overrides=args.text,
+            refine_force_arc=args.force_arc,
         )
         out_svg = args.out / name / "output.svg"
         t_start = time.perf_counter()
