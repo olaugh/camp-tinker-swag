@@ -168,10 +168,19 @@ def _crop_with_mask(image: np.ndarray, polygon: np.ndarray,
 def _eval_params_arc(text: str, ttf_path: str, size_px: float,
                      baseline: Baseline, dy: float, dx: float, ls: float,
                      source_gray: np.ndarray, viewport: tuple[int, int, int, int],
-                     full_h: int, full_w: int) -> float:
+                     full_h: int, full_w: int,
+                     max_text_w: float = float("inf")) -> float:
     """Render the text on its arc inside `viewport` and return composite loss."""
+    # Cheap pre-check: if the rendered string would overflow `max_text_w`, drop
+    # immediately rather than render and find out the canvas truncated it.
+    try:
+        f = ImageFont.truetype(ttf_path, max(int(round(size_px)), 8))
+        _, total_w, _, _ = _measure_run(text, f, ls)
+        if total_w > max_text_w:
+            return float("inf")
+    except Exception:
+        return float("inf")
     cx, cy, r, _t0, _t1 = baseline.params
-    # Render at full source resolution then crop to viewport for comparison.
     rendered = render_arc_text(full_h, full_w, text, ttf_path, size_px,
                                cx, cy, r, letter_spacing_px=ls, dy=dy, dx=dx)
     x0, y0, x1, y1 = viewport
@@ -183,7 +192,15 @@ def _eval_params_arc(text: str, ttf_path: str, size_px: float,
 def _eval_params_line(text: str, ttf_path: str, size_px: float,
                       x: float, y: float, ls: float,
                       source_gray: np.ndarray, viewport: tuple[int, int, int, int],
-                      full_h: int, full_w: int) -> float:
+                      full_h: int, full_w: int,
+                      max_text_w: float = float("inf")) -> float:
+    try:
+        f = ImageFont.truetype(ttf_path, max(int(round(size_px)), 8))
+        _, total_w, _, _ = _measure_run(text, f, ls)
+        if total_w > max_text_w:
+            return float("inf")
+    except Exception:
+        return float("inf")
     rendered = render_line_text(full_h, full_w, text, ttf_path, size_px,
                                 x, y, letter_spacing_px=ls)
     x0, y0, x1, y1 = viewport
@@ -267,16 +284,25 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
 
     text = dt.text or ""
 
+    # Hard upper bound on rendered text width: ~115% of the source polygon's
+    # x-extent (or arc chord length for arc baselines). Forbids the optimizer
+    # picking a font/size combo whose rendered text overflows -- without this,
+    # overflow that falls past the canvas edge isn't scored and the loss
+    # silently rewards huge fonts.
+    poly_w = float(dt.polygon[:, 0].max() - dt.polygon[:, 0].min())
+    max_text_w = poly_w * 1.15
+
     def render_with(baseline: Baseline, ttf: str, s: float, dy: float,
                     dx: float, ls: float) -> float:
         if baseline.kind == "arc":
             return _eval_params_arc(text, ttf, s, baseline, dy, dx, ls,
-                                    crop, viewport, H, W)
-        # straight
+                                    crop, viewport, H, W,
+                                    max_text_w=max_text_w)
         line_x = float(dt.polygon[:, 0].mean())
         line_y = float(dt.polygon[:, 1].max()) - s * 0.18
         return _eval_params_line(text, ttf, s, line_x + dx, line_y + dy, ls,
-                                 crop, viewport, H, W)
+                                 crop, viewport, H, W,
+                                 max_text_w=max_text_w)
 
     # Per-baseline displacement ranges
     def ranges(baseline: Baseline) -> tuple[np.ndarray, np.ndarray]:
