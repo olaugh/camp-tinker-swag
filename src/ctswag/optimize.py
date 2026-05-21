@@ -287,6 +287,9 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
                                                    dy=float(dy),
                                                    ls_px=float(ls),
                                                    dx=0.0))
+            # If nothing produced a finite score, skip this (font, baseline).
+            if local_best[1] is None:
+                continue
             # Refine dx around local best
             for dx in dxs_b:
                 params = dict(local_best[1])
