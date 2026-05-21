@@ -84,6 +84,10 @@ def main():
     p.add_argument("--tracers", nargs="+", default=None)
     p.add_argument("--inpainters", nargs="+", default=["white"])
     p.add_argument("--top-k-fonts", type=int, default=5)
+    p.add_argument("--corpus-min-weight", type=int, default=0,
+                   help="Drop TTFs below this weight from the corpus.")
+    p.add_argument("--text", nargs="+", default=None,
+                   help="Override OCR with fixed text strings, assigned top-to-bottom.")
     args = p.parse_args()
 
     badge = None
@@ -129,6 +133,8 @@ def main():
             detector=det, recognizer=("tesseract" if rec == "synth" else rec),
             inpainter=ip, tracer=tr,
             font_corpus_dir=str(args.fonts), top_k_fonts=args.top_k_fonts,
+            corpus_min_weight=args.corpus_min_weight,
+            text_overrides=args.text,
         )
         out_svg = args.out / name / "output.svg"
         t_start = time.perf_counter()

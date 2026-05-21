@@ -23,14 +23,20 @@ from .types import FontMatch
 _WEIGHT_RE = re.compile(r"-(\d{3})\.ttf$", re.IGNORECASE)
 
 
-def discover_corpus(root: Path | str) -> list[FontMatch]:
-    """Walk fonts/ and produce a FontMatch entry per TTF."""
+def discover_corpus(root: Path | str, *, min_weight: int = 0) -> list[FontMatch]:
+    """Walk fonts/ and produce a FontMatch entry per TTF.
+
+    min_weight: drop any TTF whose weight (parsed from the filename suffix)
+    is below this threshold. 700 = bold, 800 = extrabold.
+    """
     root = Path(root)
     out: list[FontMatch] = []
     for ttf in sorted(root.rglob("*.ttf")):
         family = ttf.parent.name
         m = _WEIGHT_RE.search(ttf.name)
         weight = int(m.group(1)) if m else 400
+        if weight < min_weight:
+            continue
         out.append(FontMatch(family=family, weight=weight, ttf_path=str(ttf)))
     return out
 
@@ -111,25 +117,40 @@ def _resize_to(img: np.ndarray, h: int, w: int) -> np.ndarray:
 
 
 def _score(rendered: np.ndarray, source: np.ndarray) -> tuple[float, float, float]:
-    """Returns (composite, l1, ssim_val).
+    """Symmetric chamfer distance between the binarized ink masks.
 
-    Scores on the BINARIZED ink mask rather than the grayscale image to avoid
-    being dominated by anti-aliasing differences between cairosvg and Pillow.
-    A small Gaussian blur is applied before binarising so single-pixel
-    misalignments don't cause maximum-distance penalties.
+    Returns (composite, l1, ssim_val). The L1 and SSIM components are kept
+    for diagnostic purposes; `composite` is the chamfer distance NORMALISED
+    by image height (so 0.1 == ~10% of the height) and is what the
+    ranker / optimizer minimise.
     """
     import cv2
-    # Blur slightly to forgive sub-pixel jitter
-    r = cv2.GaussianBlur(rendered, (3, 3), 0.7)
-    s = cv2.GaussianBlur(source, (3, 3), 0.7)
-    rb = (r < 160).astype(np.float32)
-    sb = (s < 160).astype(np.float32)
-    l1 = float(np.mean(np.abs(rb - sb)))
+    if rendered.size == 0 or source.size == 0:
+        return float("inf"), float("inf"), 0.0
+    # binarize
+    rb = (rendered < 160).astype(np.uint8)
+    sb = (source   < 160).astype(np.uint8)
+    if rb.sum() == 0 or sb.sum() == 0:
+        return float("inf"), float("inf"), 0.0
+    # distanceTransform: zero pixels are obstacles, returns distance from each
+    # non-zero pixel to the nearest zero pixel. We invert ink so we get the
+    # distance from background to nearest ink.
+    r_dist = cv2.distanceTransform(1 - rb, cv2.DIST_L2, 3)
+    s_dist = cv2.distanceTransform(1 - sb, cv2.DIST_L2, 3)
+    # Asymmetric: how far is the source's ink from the nearest rendered ink?
+    n_s = float(sb.sum())
+    n_r = float(rb.sum())
+    d_sr = float((sb * r_dist).sum()) / max(n_s, 1.0)
+    d_rs = float((rb * s_dist).sum()) / max(n_r, 1.0)
+    chamfer = 0.5 * (d_sr + d_rs)
+    # Normalise to be roughly scale-invariant.
+    composite = chamfer / max(rendered.shape[0], 1)
+    # Diagnostic SSIM / L1 (computed on the binary masks).
+    l1 = float(np.mean(np.abs(rb.astype(np.float32) - sb.astype(np.float32))))
     try:
-        v = float(ssim(rb, sb, data_range=1.0))
+        v = float(ssim(rb.astype(np.float32), sb.astype(np.float32), data_range=1.0))
     except Exception:
         v = 0.0
-    composite = 0.5 * l1 + 0.5 * (1.0 - v)
     return composite, l1, v
 
 

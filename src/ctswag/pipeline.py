@@ -36,6 +36,10 @@ class PipelineConfig:
     refine: bool = True               # Run optimize.sweep on top-K finalists
     refine_top_k: int = 6             # How many finalists to keep into the sweep
     refine_try_arc: bool = True       # For "line" baselines, also sweep arc radii
+    corpus_min_weight: int = 0        # Drop TTFs lighter than this (700=bold)
+    # If provided, skip OCR entirely and assign these strings to detected
+    # polygons in top-to-bottom order. Same length as expected polygon count.
+    text_overrides: list[str] | None = None
 
 
 def _crop_polygon(img: np.ndarray, polygon: np.ndarray,
@@ -88,27 +92,47 @@ def run(input_path: Path | str,
 
     # 2. recognize + baseline + crop, per polygon
     t0 = time.perf_counter()
-    rec_fn = recognize_mod.REGISTRY[cfg.recognizer]
-    # First do a preliminary recognition pass to get text per polygon, so the
-    # arc merger has labels to splice in left-to-right order.
     pre_texts: list[str] = []
     pre_polys: list[np.ndarray] = []
-    for poly in polygons:
-        bl = baseline_mod.fit(poly)
-        if bl.kind == "arc":
-            crop = unwarp_mod.unwarp_arc(img_bgr, poly, bl)
-        else:
-            crop = _crop_polygon(img_bgr, poly, height_mul=cfg.text_height_factor)
-        if crop.size == 0:
-            continue
-        text, _ = rec_fn(crop[:, :, ::-1])
-        clean = "".join(c for c in text if c.isalnum() or c.isspace()).strip().upper()
-        pre_texts.append(clean)
-        pre_polys.append(poly)
+
+    if cfg.text_overrides is not None:
+        # Skip OCR entirely. We need a label per detected polygon to feed the
+        # arc merger though; we'll assign labels post-merge based on spatial
+        # position (top->bottom). For now mark each polygon with a placeholder.
+        for poly in polygons:
+            pre_polys.append(poly)
+            pre_texts.append("")
+    else:
+        rec_fn = recognize_mod.REGISTRY[cfg.recognizer]
+        for poly in polygons:
+            bl = baseline_mod.fit(poly)
+            if bl.kind == "arc":
+                crop = unwarp_mod.unwarp_arc(img_bgr, poly, bl)
+            else:
+                crop = _crop_polygon(img_bgr, poly, height_mul=cfg.text_height_factor)
+            if crop.size == 0:
+                continue
+            text, _ = rec_fn(crop[:, :, ::-1])
+            clean = "".join(c for c in text if c.isalnum() or c.isspace()).strip().upper()
+            pre_texts.append(clean)
+            pre_polys.append(poly)
+
     # Scale arc-residual threshold to image size: 1% of the short edge.
     short_edge = float(min(H, W))
     merged = merge_mod.maybe_merge(pre_polys, pre_texts,
                                    residual_threshold=max(8.0, 0.01 * short_edge))
+
+    # If text was overridden, assign expected strings by polygon-centroid Y
+    # (top-to-bottom).
+    if cfg.text_overrides is not None:
+        order = sorted(range(len(merged)),
+                       key=lambda i: merged[i][0][:, 1].mean())
+        new_merged = list(merged)
+        for rank, idx in enumerate(order):
+            if rank < len(cfg.text_overrides):
+                poly_i, _t, bl_i = new_merged[idx]
+                new_merged[idx] = (poly_i, cfg.text_overrides[rank], bl_i)
+        merged = new_merged
 
     texts: list[DetectedText] = []
     for poly, joined_text, merged_baseline in merged:
@@ -135,7 +159,8 @@ def run(input_path: Path | str,
 
     # 3. font id
     t0 = time.perf_counter()
-    corpus = fontid_mod.discover_corpus(cfg.font_corpus_dir)
+    corpus = fontid_mod.discover_corpus(cfg.font_corpus_dir,
+                                        min_weight=cfg.corpus_min_weight)
     matches: list[FontMatch] = []
     candidates_per_text: list[list[FontMatch]] = []
     for dt in texts:
