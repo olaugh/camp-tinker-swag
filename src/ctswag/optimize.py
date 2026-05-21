@@ -1,0 +1,302 @@
+"""Phase 3: local sweep over (font, size, letter-spacing, dx/dy, arc radius).
+
+For each text region we already have an initial guess from font-ID. This
+module renders that text into the *source crop region* with various
+parameter perturbations, picks the parameters that minimize a pixel-level
+loss, and returns updated FontMatch values for the assembler to use.
+
+Crucially it sweeps across the top-K finalist fonts simultaneously: weight
+is not part of a continuous axis, so we just try several candidate TTFs
+and let the loss decide which one survives.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import replace
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+from .fontid import _crop_text, _score
+from .types import Baseline, DetectedText, FontMatch
+
+
+# --- text rendering on an arc, in pure PIL ---------------------------------
+
+def _measure_run(text: str, font: ImageFont.FreeTypeFont,
+                 letter_spacing_px: float = 0.0) -> tuple[list[tuple[str, int]], int, int, int]:
+    """Returns (per-char (ch, advance) list, total_w, ascent, descent)."""
+    ascent, descent = font.getmetrics()
+    char_advances: list[tuple[str, int]] = []
+    total = 0
+    for i, ch in enumerate(text):
+        # advance = width of bbox; for space use a reasonable fixed advance
+        bb = font.getbbox(ch)
+        adv = bb[2] - bb[0]
+        if ch == " ":
+            adv = max(adv, int(font.size * 0.3))
+        char_advances.append((ch, max(adv, 0)))
+        total += adv
+        if i < len(text) - 1:
+            total += int(letter_spacing_px)
+    return char_advances, total, ascent, descent
+
+
+def render_arc_text(canvas_h: int, canvas_w: int,
+                    text: str, ttf_path: str, size_px: float,
+                    cx: float, cy: float, r: float,
+                    letter_spacing_px: float = 0.0,
+                    dy: float = 0.0,
+                    dx: float = 0.0) -> np.ndarray:
+    """Render `text` on an arc of radius r centered at (cx, cy + dy) so
+    each glyph's baseline sits on the arc, glyph is rotated to the tangent.
+
+    Returns a grayscale uint8 ndarray (white bg, black ink). The text is
+    centered on the arc (so it spans equal arc-length to either side of
+    angle -pi/2, the top of the circle). `dx` shifts along the arc.
+    """
+    img = Image.new("L", (canvas_w, canvas_h), color=255)
+    cy_eff = cy + dy
+    font = ImageFont.truetype(ttf_path, max(int(round(size_px)), 8))
+    chars, total_w, ascent, descent = _measure_run(text, font, letter_spacing_px)
+    if total_w <= 0:
+        return np.array(img)
+
+    # Convert linear total-width into angular total via arc length L = r * dtheta
+    total_dtheta = total_w / max(r, 1.0)
+    start_theta = -math.pi / 2 - total_dtheta / 2 + dx / max(r, 1.0)
+
+    # Pre-render each glyph individually onto a transparent canvas, rotate, paste.
+    cursor = 0
+    for ch, adv in chars:
+        # angle at the midpoint of this glyph
+        glyph_theta_mid = start_theta + (cursor + adv / 2.0) / max(r, 1.0)
+        # baseline anchor on the arc
+        anchor_x = cx + r * math.cos(glyph_theta_mid)
+        anchor_y = cy_eff + r * math.sin(glyph_theta_mid)
+        # tangent angle (perpendicular to radius vector)
+        tangent_deg = math.degrees(glyph_theta_mid + math.pi / 2)
+        # Render this single glyph in a tight box
+        bb = font.getbbox(ch)
+        gw = max(bb[2] - bb[0], 1)
+        gh = max(bb[3] - bb[1], 1)
+        # pad a little
+        pad = 2
+        gimg = Image.new("LA", (gw + 2 * pad, gh + 2 * pad), color=(255, 0))
+        gdraw = ImageDraw.Draw(gimg)
+        gdraw.text((pad - bb[0], pad - bb[1]), ch, fill=(0, 255), font=font)
+        # Rotate so the baseline is parallel to the arc tangent.
+        # In PIL the rotation is CCW with the screen Y inverted -> use -tangent_deg.
+        rot = gimg.rotate(-tangent_deg, resample=Image.BICUBIC, expand=True)
+        # The glyph's anchor is its baseline-left (approx the bottom-left of bbox).
+        # In gimg before rotation, the baseline-left is at (pad - bb[0], pad - bb[1] + bb[3]).
+        anchor_in_glyph = (pad - bb[0], pad - bb[1] + bb[3])
+        # Compute where that anchor lands after rotation (rotate around center).
+        cx_g, cy_g = gimg.size[0] / 2, gimg.size[1] / 2
+        # Vector from rotation center to anchor:
+        vx = anchor_in_glyph[0] - cx_g
+        vy = anchor_in_glyph[1] - cy_g
+        # After rotating by -tangent_deg around the glyph center
+        c = math.cos(math.radians(-tangent_deg))
+        s = math.sin(math.radians(-tangent_deg))
+        rvx = c * vx - s * vy
+        rvy = s * vx + c * vy
+        # Now the anchor is at (rot.center + (rvx, rvy)).
+        rcx, rcy = rot.size[0] / 2, rot.size[1] / 2
+        anchor_in_rot = (rcx + rvx, rcy + rvy)
+        # Paste so the anchor aligns with (anchor_x, anchor_y)
+        paste_x = int(round(anchor_x - anchor_in_rot[0]))
+        paste_y = int(round(anchor_y - anchor_in_rot[1]))
+        img.paste(rot, (paste_x, paste_y), rot)
+        cursor += adv + int(letter_spacing_px)
+
+    return np.array(img)
+
+
+def render_line_text(canvas_h: int, canvas_w: int,
+                     text: str, ttf_path: str, size_px: float,
+                     x: float, y: float,
+                     letter_spacing_px: float = 0.0) -> np.ndarray:
+    """Render straight text centered at (x, y), baseline through y."""
+    img = Image.new("L", (canvas_w, canvas_h), color=255)
+    font = ImageFont.truetype(ttf_path, max(int(round(size_px)), 8))
+    chars, total_w, _, _ = _measure_run(text, font, letter_spacing_px)
+    cursor = x - total_w / 2.0
+    bb_y = 0
+    # use first non-empty char's bbox to fix baseline -> top offset
+    for ch, _ in chars:
+        if ch.strip():
+            bb_y = font.getbbox(ch)[3]
+            break
+    draw = ImageDraw.Draw(img)
+    for ch, adv in chars:
+        bb = font.getbbox(ch)
+        draw.text((cursor - bb[0], y - bb[3]), ch, fill=0, font=font)
+        cursor += adv + letter_spacing_px
+    return np.array(img)
+
+
+# --- scoring -------------------------------------------------------------
+
+def _crop_with_mask(image: np.ndarray, polygon: np.ndarray,
+                    pad: int = 8) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Tight axis-aligned crop around a polygon, padded. Returns (crop, bbox)."""
+    H, W = image.shape[:2]
+    x0 = max(int(polygon[:, 0].min()) - pad, 0)
+    x1 = min(int(polygon[:, 0].max()) + pad + 1, W)
+    y0 = max(int(polygon[:, 1].min()) - pad, 0)
+    y1 = min(int(polygon[:, 1].max()) + pad + 1, H)
+    return image[y0:y1, x0:x1], (x0, y0, x1, y1)
+
+
+def _eval_params_arc(text: str, ttf_path: str, size_px: float,
+                     baseline: Baseline, dy: float, dx: float, ls: float,
+                     source_gray: np.ndarray, viewport: tuple[int, int, int, int],
+                     full_h: int, full_w: int) -> float:
+    """Render the text on its arc inside `viewport` and return composite loss."""
+    cx, cy, r, _t0, _t1 = baseline.params
+    # Render at full source resolution then crop to viewport for comparison.
+    rendered = render_arc_text(full_h, full_w, text, ttf_path, size_px,
+                               cx, cy, r, letter_spacing_px=ls, dy=dy, dx=dx)
+    x0, y0, x1, y1 = viewport
+    sub = rendered[y0:y1, x0:x1]
+    composite, _l1, _v = _score(sub, source_gray)
+    return composite
+
+
+def _eval_params_line(text: str, ttf_path: str, size_px: float,
+                      x: float, y: float, ls: float,
+                      source_gray: np.ndarray, viewport: tuple[int, int, int, int],
+                      full_h: int, full_w: int) -> float:
+    rendered = render_line_text(full_h, full_w, text, ttf_path, size_px,
+                                x, y, letter_spacing_px=ls)
+    x0, y0, x1, y1 = viewport
+    sub = rendered[y0:y1, x0:x1]
+    composite, _l1, _v = _score(sub, source_gray)
+    return composite
+
+
+# --- sweep --------------------------------------------------------------
+
+def sweep(dt: DetectedText, candidates: list[FontMatch],
+          source_img_bgr: np.ndarray,
+          *, n_size: int = 5, n_dy: int = 5, n_ls: int = 3,
+          n_dx: int = 5,
+          try_arc_for_line: bool = True,
+          arc_centers_hint: list[tuple[float, float]] | None = None,
+          ) -> tuple[FontMatch, dict, Baseline | None]:
+    """Run a coordinate-descent grid sweep on each candidate font and
+    return (best_font, best_params, best_baseline). best_baseline may
+    override dt.baseline if the sweep finds an arc fit beats line.
+    """
+    if not candidates:
+        return FontMatch(family="sans-serif", weight=700), {}, None
+
+    H, W = source_img_bgr.shape[:2]
+    source_gray = cv2.cvtColor(source_img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Restrict the comparison viewport to a padded polygon bbox so we don't
+    # have to render-and-score the whole image.
+    crop, viewport = _crop_with_mask(source_gray, dt.polygon, pad=12)
+    if crop.size == 0:
+        return candidates[0], {}, None
+
+    initial_size = candidates[0].size_px if candidates[0].size_px else 64.0
+    size_range = (initial_size * 0.75, initial_size * 1.30)
+    sizes = np.linspace(size_range[0], size_range[1], n_size)
+    lss = np.linspace(0, initial_size * 0.15, n_ls)
+
+    # Build a set of candidate baselines to try.
+    candidate_baselines: list[Baseline] = []
+    if dt.baseline is not None and dt.baseline.kind == "arc":
+        candidate_baselines.append(dt.baseline)
+    if dt.baseline is None or dt.baseline.kind == "line" or try_arc_for_line:
+        # Hypothesis: text follows an arc concentric with the badge (i.e.
+        # arc centers are above/below the polygon centroid). Try a few
+        # radii. For straight text in the original (radius=inf), only the
+        # initial line fit will be kept by the sweep; the arcs just give
+        # us a chance to detect when "2025" actually curves.
+        cx_p = float(dt.polygon[:, 0].mean())
+        cy_p = float(dt.polygon[:, 1].mean())
+        text_w = float(dt.polygon[:, 0].max() - dt.polygon[:, 0].min())
+        # Chord-and-sagitta: try arcs whose center is above the polygon at
+        # distances ranging from 2x text_w (heavy curve) to 12x text_w
+        # (nearly flat). Center BELOW (concave-down text) is unusual for
+        # badge designs so we skip it -- saves half the sweep budget.
+        for k in (1.5, 2.5, 4.0, 8.0):
+            cy_arc = cy_p + k * text_w / 2   # arc center BELOW polygon
+            r_arc = abs(cy_arc - cy_p)
+            candidate_baselines.append(
+                Baseline(kind="arc",
+                         params=(cx_p, cy_arc, r_arc, 0.0, 0.0),
+                         residual=0.0)
+            )
+        # Also include the original line baseline.
+        if dt.baseline is not None and dt.baseline.kind == "line":
+            candidate_baselines.append(dt.baseline)
+
+    text = dt.text or ""
+
+    def render_with(baseline: Baseline, ttf: str, s: float, dy: float,
+                    dx: float, ls: float) -> float:
+        if baseline.kind == "arc":
+            return _eval_params_arc(text, ttf, s, baseline, dy, dx, ls,
+                                    crop, viewport, H, W)
+        # straight
+        line_x = float(dt.polygon[:, 0].mean())
+        line_y = float(dt.polygon[:, 1].max()) - s * 0.18
+        return _eval_params_line(text, ttf, s, line_x + dx, line_y + dy, ls,
+                                 crop, viewport, H, W)
+
+    # Per-baseline displacement ranges
+    def ranges(baseline: Baseline) -> tuple[np.ndarray, np.ndarray]:
+        if baseline.kind == "arc":
+            r0 = baseline.params[2]
+            dys_b = np.linspace(-r0 * 0.05, r0 * 0.05, n_dy)
+            dxs_b = np.linspace(-initial_size * 0.6, initial_size * 0.6, n_dx)
+        else:
+            dys_b = np.linspace(-initial_size * 0.3, initial_size * 0.3, n_dy)
+            dxs_b = np.linspace(-initial_size * 0.3, initial_size * 0.3, n_dx)
+        return dys_b, dxs_b
+
+    best = (float("inf"), None, None, None)  # (score, fm, params, baseline)
+
+    for fm in candidates:
+        for baseline in candidate_baselines:
+            dys_b, dxs_b = ranges(baseline)
+            local_best = (float("inf"), None)
+            # Coarse: sweep (size, dy, ls) at dx=0
+            for s in sizes:
+                for dy in dys_b:
+                    for ls in lss:
+                        sc = render_with(baseline, fm.ttf_path, float(s),
+                                          float(dy), 0.0, float(ls))
+                        if sc < local_best[0]:
+                            local_best = (sc, dict(size_px=float(s),
+                                                   dy=float(dy),
+                                                   ls_px=float(ls),
+                                                   dx=0.0))
+            # Refine dx around local best
+            for dx in dxs_b:
+                params = dict(local_best[1])
+                params["dx"] = float(dx)
+                sc = render_with(baseline, fm.ttf_path, params["size_px"],
+                                  params["dy"], params["dx"], params["ls_px"])
+                if sc < local_best[0]:
+                    local_best = (sc, params)
+            if local_best[0] < best[0]:
+                best = (local_best[0], fm, local_best[1], baseline)
+
+    final_score, fm, params, baseline = best
+    if fm is None:
+        return candidates[0], {}, None
+    out = replace(fm,
+                  size_px=params["size_px"],
+                  letter_spacing_em=params["ls_px"] / max(params["size_px"], 1.0),
+                  dx=params["dx"], dy=params["dy"],
+                  score=final_score)
+    # If the sweep found a better baseline than dt's, return it so the
+    # caller can attach it to the DetectedText before assembly.
+    new_baseline = baseline if baseline is not dt.baseline else None
+    return out, params, new_baseline

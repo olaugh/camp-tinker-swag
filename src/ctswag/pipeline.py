@@ -14,11 +14,12 @@ from . import detect as detect_mod
 from . import fontid as fontid_mod
 from . import inpaint as inpaint_mod
 from . import merge as merge_mod
+from . import optimize as optimize_mod
 from . import recognize as recognize_mod
 from . import trace as trace_mod
 from . import unwarp as unwarp_mod
 from .assemble import assemble
-from .types import DetectedText, FontMatch, PipelineResult
+from .types import Baseline, DetectedText, FontMatch, PipelineResult
 
 
 @dataclass
@@ -32,6 +33,9 @@ class PipelineConfig:
     detector_kwargs: dict[str, Any] = field(default_factory=dict)
     tracer_kwargs: dict[str, Any] = field(default_factory=dict)
     top_k_fonts: int = 5
+    refine: bool = True               # Run optimize.sweep on top-K finalists
+    refine_top_k: int = 6             # How many finalists to keep into the sweep
+    refine_try_arc: bool = True       # For "line" baselines, also sweep arc radii
 
 
 def _crop_polygon(img: np.ndarray, polygon: np.ndarray,
@@ -133,12 +137,20 @@ def run(input_path: Path | str,
     t0 = time.perf_counter()
     corpus = fontid_mod.discover_corpus(cfg.font_corpus_dir)
     matches: list[FontMatch] = []
+    candidates_per_text: list[list[FontMatch]] = []
     for dt in texts:
         if not dt.text or not corpus:
             matches.append(FontMatch(family="sans-serif", weight=700))
+            candidates_per_text.append([])
             continue
         gray = cv2.cvtColor(dt.crop, cv2.COLOR_BGR2GRAY)
-        candidates = fontid_mod.match(gray, dt.text, corpus, top_k=cfg.top_k_fonts)
+        top_k = max(cfg.top_k_fonts, cfg.refine_top_k if cfg.refine else 0)
+        # When refining, skip the per-candidate letter-spacing sweep at the
+        # font-ID stage: the optimizer will do a more thorough sweep on the
+        # finalists (size, ls, dx, dy, baseline) so we just need a top-K.
+        candidates = fontid_mod.match(gray, dt.text, corpus, top_k=top_k,
+                                      skip_fine=cfg.refine)
+        candidates_per_text.append(candidates)
         best = candidates[0] if candidates else FontMatch(family="sans-serif", weight=700)
         # Re-record a sensible size for assembly.
         # The polygon's y-extent is wrong for both arched (arc sag) and tilted
@@ -166,6 +178,28 @@ def run(input_path: Path | str,
         best_dict["size_px"] = phys_h / 0.72
         matches.append(FontMatch(**best_dict))
     timings["fontid"] = time.perf_counter() - t0
+
+    # 3b. local sweep over (size, ls, dy=arc-radius-shift, dx, candidate baseline)
+    if cfg.refine:
+        t0 = time.perf_counter()
+        refined: list[FontMatch] = []
+        for dt, fm, cands in zip(texts, matches, candidates_per_text):
+            if not cands or not dt.text:
+                refined.append(fm)
+                continue
+            # Use the top-K finalists as the discrete weight/family axis.
+            tops = cands[: cfg.refine_top_k]
+            # Make sure they all carry the same initial size estimate.
+            seeded = [type(c)(**{**c.__dict__, "size_px": fm.size_px}) for c in tops]
+            best_fm, params, new_baseline = optimize_mod.sweep(
+                dt, seeded, img_bgr,
+                try_arc_for_line=cfg.refine_try_arc,
+            )
+            refined.append(best_fm)
+            if new_baseline is not None:
+                dt.baseline = new_baseline
+        matches = refined
+        timings["refine"] = time.perf_counter() - t0
     out.font_matches = matches
 
     # 4. inpaint

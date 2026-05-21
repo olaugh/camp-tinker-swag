@@ -158,9 +158,10 @@ def match(crop_gray: np.ndarray, text: str,
           corpus: Iterable[FontMatch],
           *, top_k: int = 5,
           working_h: int = 128,
-          spacings_px: tuple[float, ...] = (0, 2, 4, 6, 8, 10, 12),
-          coarse_k: int = 80,
-          workers: int | None = None) -> list[FontMatch]:
+          spacings_px: tuple[float, ...] = (0, 4, 8),
+          coarse_k: int = 40,
+          workers: int | None = None,
+          skip_fine: bool = False) -> list[FontMatch]:
     """Score every (font, weight) on a tight text crop.
 
     For large corpora a two-stage pass is used:
@@ -204,6 +205,8 @@ def match(crop_gray: np.ndarray, text: str,
         finalists = coarse[:coarse_k]
     else:
         finalists = corpus_list
+    if skip_fine:
+        return finalists[:top_k]
     # Stage 2: fine pass over finalists with full spacing sweep
     fine = run(finalists, spacings=spacings_px)
     return fine[:top_k]

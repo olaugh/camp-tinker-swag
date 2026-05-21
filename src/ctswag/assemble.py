@@ -74,12 +74,17 @@ def assemble(trace: TraceResult,
         family = fm.family if fm else "sans-serif"
         weight = str(fm.weight) if fm else "700"
         size = f"{fm.size_px:.2f}" if fm and fm.size_px else "48"
+        ls_em = fm.letter_spacing_em if fm else 0.0
+        dx = fm.dx if fm else 0.0
+        dy = fm.dy if fm else 0.0
         if dt.baseline and dt.baseline.kind == "arc":
             cx, cy, r, t0, t1 = dt.baseline.params
+            # Apply optimiser dy as a vertical shift of the arc center
+            cy_eff = cy + dy
             arc_id = f"arc-{i}"
             arc = etree.SubElement(defs, "path")
             arc.set("id", arc_id)
-            arc.set("d", _arc_path_d(cx, cy, r, t0, t1))
+            arc.set("d", _arc_path_d(cx, cy_eff, r, t0, t1))
             arc.set("fill", "none")
             t = etree.SubElement(text_g, "text")
             t.set("text-anchor", "middle")
@@ -87,15 +92,24 @@ def assemble(trace: TraceResult,
             t.set("font-family", family)
             t.set("font-weight", weight)
             t.set("font-size", size)
+            if ls_em:
+                # SVG letter-spacing is in length units (px) when given without unit
+                t.set("letter-spacing", f"{ls_em * float(size):.2f}")
             tp = etree.SubElement(t, "textPath")
             tp.set("{%s}href" % XLINK_NS, f"#{arc_id}")
             tp.set("href", f"#{arc_id}")
-            tp.set("startOffset", "50%")
+            # dx along the arc -> shift startOffset (linear along-arc length)
+            arc_len = abs(t1 - t0) * r  # rough arc length
+            if arc_len > 0:
+                offset_pct = 50.0 + (dx / arc_len) * 100.0
+                tp.set("startOffset", f"{offset_pct:.2f}%")
+            else:
+                tp.set("startOffset", "50%")
             tp.text = dt.text
         else:
             # Straight text: place at polygon centroid, baseline-adjusted.
-            x = float(dt.polygon[:, 0].mean())
-            y = float(dt.polygon[:, 1].max()) - 4  # rough baseline
+            x = float(dt.polygon[:, 0].mean()) + dx
+            y = float(dt.polygon[:, 1].max()) - 4 + dy
             t = etree.SubElement(text_g, "text")
             t.set("x", f"{x:.2f}")
             t.set("y", f"{y:.2f}")
@@ -104,6 +118,8 @@ def assemble(trace: TraceResult,
             t.set("font-family", family)
             t.set("font-weight", weight)
             t.set("font-size", size)
+            if ls_em:
+                t.set("letter-spacing", f"{ls_em * float(size):.2f}")
             t.text = dt.text
 
     output_path = Path(output_path)
