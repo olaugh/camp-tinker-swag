@@ -4,7 +4,3 @@ __pycache__/
 *.egg-info/
 runs/
 .cache/
-# Wide font corpus from scripts/fetch_fonts_full.py is too big to vendor.
-# Keep the small bootstrap set under fonts/_minimal/.
-fonts/
-!fonts/_minimal/
