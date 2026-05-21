@@ -140,13 +140,28 @@ def render_line_text(canvas_h: int, canvas_w: int,
 # --- scoring -------------------------------------------------------------
 
 def _crop_with_mask(image: np.ndarray, polygon: np.ndarray,
-                    pad: int = 8) -> tuple[np.ndarray, tuple[int, int, int, int]]:
-    """Tight axis-aligned crop around a polygon, padded. Returns (crop, bbox)."""
+                    pad: int | None = None,
+                    pad_factor: float = 0.5
+                    ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Axis-aligned crop around a polygon, padded by `pad_factor * polygon_size`.
+
+    A generous padding (default 50% of each dim) ensures the loss penalises
+    rendered text that extends beyond the source's bbox -- otherwise the
+    optimizer learns to pick huge fonts whose extra ink falls outside the
+    crop and so isn't scored.
+    """
     H, W = image.shape[:2]
-    x0 = max(int(polygon[:, 0].min()) - pad, 0)
-    x1 = min(int(polygon[:, 0].max()) + pad + 1, W)
-    y0 = max(int(polygon[:, 1].min()) - pad, 0)
-    y1 = min(int(polygon[:, 1].max()) + pad + 1, H)
+    poly_w = float(polygon[:, 0].max() - polygon[:, 0].min())
+    poly_h = float(polygon[:, 1].max() - polygon[:, 1].min())
+    if pad is None:
+        pad_x = int(poly_w * pad_factor)
+        pad_y = int(poly_h * pad_factor)
+    else:
+        pad_x = pad_y = pad
+    x0 = max(int(polygon[:, 0].min()) - pad_x, 0)
+    x1 = min(int(polygon[:, 0].max()) + pad_x + 1, W)
+    y0 = max(int(polygon[:, 1].min()) - pad_y, 0)
+    y1 = min(int(polygon[:, 1].max()) + pad_y + 1, H)
     return image[y0:y1, x0:x1], (x0, y0, x1, y1)
 
 
@@ -197,9 +212,11 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
     H, W = source_img_bgr.shape[:2]
     source_gray = cv2.cvtColor(source_img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Restrict the comparison viewport to a padded polygon bbox so we don't
-    # have to render-and-score the whole image.
-    crop, viewport = _crop_with_mask(source_gray, dt.polygon, pad=12)
+    # Restrict the comparison viewport to a polygon bbox padded by 50% of
+    # its own dimensions. Generous padding makes "rendered text spills past
+    # the source's bbox" visible to the loss; without it the chamfer is
+    # silently low because spilled ink simply falls outside the crop.
+    crop, viewport = _crop_with_mask(source_gray, dt.polygon, pad_factor=0.5)
     if crop.size == 0:
         return candidates[0], {}, None
 
