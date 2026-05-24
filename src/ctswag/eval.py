@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import dataclasses
+import io
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -14,10 +19,41 @@ from skimage.metrics import structural_similarity as ssim
 
 
 def render_svg(svg_path: Path | str, *, width: int, height: int) -> np.ndarray:
-    """Rasterize an SVG via cairosvg. Returns RGB ndarray."""
+    """Rasterize an SVG via resvg (which fully supports textPath and
+    @font-face), loading fonts from CTSWAG_FONTS_DIR if set. Falls back
+    to cairosvg if resvg isn't on PATH.
+
+    cairosvg ignores @font-face data URLs AND has shaky textPath layout,
+    so SSIM computed from cairosvg renders has almost no signal on text.
+    rsvg-convert (an alternative) silently skips textPath entirely.
+    resvg is the only easy-to-install renderer that gets both right.
+    """
     svg_path = Path(svg_path)
-    png_bytes = cairosvg.svg2png(url=str(svg_path), output_width=width, output_height=height)
-    img = Image.open(__import__("io").BytesIO(png_bytes)).convert("RGB")
+    resvg = shutil.which("resvg")
+    if resvg:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            out = Path(tf.name)
+        try:
+            cmd = [resvg, "-w", str(width), "-h", str(height)]
+            fonts_dir = os.environ.get("CTSWAG_FONTS_DIR")
+            if fonts_dir and Path(fonts_dir).exists():
+                cmd += ["--use-fonts-dir", fonts_dir]
+            cmd += [str(svg_path.resolve()), str(out)]
+            subprocess.run(cmd, check=True, capture_output=True)
+            img = Image.open(out).convert("RGB")
+            return np.array(img)
+        except subprocess.CalledProcessError:
+            pass
+        finally:
+            try:
+                out.unlink()
+            except OSError:
+                pass
+    # Fallback: cairosvg (text uses default fallback font; textPath layout
+    # may differ from what browsers render).
+    png_bytes = cairosvg.svg2png(url=str(svg_path),
+                                  output_width=width, output_height=height)
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     return np.array(img)
 
 

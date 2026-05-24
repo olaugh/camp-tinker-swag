@@ -15,6 +15,7 @@ import dataclasses
 import importlib.util
 import itertools
 import json
+import os
 import sys
 import time
 import traceback
@@ -23,6 +24,15 @@ from pathlib import Path
 # Make sure src/ is on sys.path so we can import ctswag.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+
+
+def _set_fonts_dir_env(font_dir: Path) -> None:
+    """Expose `font_dir` to ctswag.eval.render_svg via CTSWAG_FONTS_DIR.
+    The renderer (resvg) loads TTFs from this directory by name so the
+    pipeline's emitted SVG <text font-family="..."> resolves to the same
+    font the optimizer scored against."""
+    if font_dir.exists():
+        os.environ["CTSWAG_FONTS_DIR"] = str(font_dir.resolve())
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -38,7 +48,7 @@ def have(mod: str) -> bool:
 
 
 def detector_options() -> list[str]:
-    opts = ["synth", "tesseract"]
+    opts = ["synth", "camp_geom", "tesseract"]
     if have("easyocr"):
         opts.append("easyocr")
     if have("doctr"):
@@ -84,13 +94,31 @@ def main():
     p.add_argument("--tracers", nargs="+", default=None)
     p.add_argument("--inpainters", nargs="+", default=["white"])
     p.add_argument("--top-k-fonts", type=int, default=5)
+    p.add_argument("--refine-top-k", type=int, default=6,
+                   help="How many fontid finalists the optimizer rescoring sees.")
     p.add_argument("--corpus-min-weight", type=int, default=0,
                    help="Drop TTFs below this weight from the corpus.")
     p.add_argument("--text", nargs="+", default=None,
                    help="Override OCR with fixed text strings, assigned top-to-bottom.")
     p.add_argument("--force-arc", action="store_true",
                    help="Force every detected text to use an arc baseline.")
+    p.add_argument("--font-overrides", nargs="+", default=None,
+                   help='Per-text font overrides as "Family:weight:path" or "-" '
+                        'to fall through to font-ID. Same top-to-bottom order '
+                        'as --text. Tags the run name so multiple overrides '
+                        'can coexist in the same runs/ directory.')
+    p.add_argument("--per-font-title", action="store_true",
+                   help="After the main combo loop, iterate over every TTF in "
+                        "the corpus (filtered by --corpus-min-weight) and run "
+                        "the pipeline once per font, forcing that font for "
+                        "the title (year auto-picks). Each run is saved in a "
+                        "dir tagged with the font's family/weight, so you can "
+                        "use build_debug_page --top-n to rank them.")
     args = p.parse_args()
+
+    # Make fonts_curated/ visible to resvg (the renderer used by
+    # ctswag.eval.render_svg for SSIM/L1 scoring).
+    _set_fonts_dir_env(args.fonts)
 
     badge = None
     if args.badge_synth:
@@ -128,15 +156,33 @@ def main():
     original = eval_mod.load_image_rgb(args.input)
     H, W = original.shape[:2]
 
+    # Parse --font-overrides once.
+    font_overrides_parsed: list[tuple[str, int, str] | None] | None = None
+    name_tag = ""
+    if args.font_overrides:
+        font_overrides_parsed = []
+        tag_bits: list[str] = []
+        for spec in args.font_overrides:
+            if spec == "-":
+                font_overrides_parsed.append(None)
+                tag_bits.append("auto")
+                continue
+            fam, wt_s, path = spec.split(":", 2)
+            font_overrides_parsed.append((fam, int(wt_s), path))
+            tag_bits.append(f"{fam}{wt_s}")
+        name_tag = "_force-" + "-".join(tag_bits)
+
     for det, rec, ip, tr in combos:
-        name = f"{det}_{rec}_{ip}_{tr}"
+        name = f"{det}_{rec}_{ip}_{tr}{name_tag}"
         print(f"\n=== {name} ===")
         cfg = PipelineConfig(
             detector=det, recognizer=("tesseract" if rec == "synth" else rec),
             inpainter=ip, tracer=tr,
             font_corpus_dir=str(args.fonts), top_k_fonts=args.top_k_fonts,
+            refine_top_k=args.refine_top_k,
             corpus_min_weight=args.corpus_min_weight,
             text_overrides=args.text,
+            font_overrides=font_overrides_parsed,
             refine_force_arc=args.force_arc,
         )
         out_svg = args.out / name / "output.svg"
@@ -193,6 +239,73 @@ def main():
         print(f"  wall {wall:.1f}s  ssim {m_all['ssim']:.3f}  L1 {m_all['l1_255']:.2f}/255"
               + (f"  complete {completeness:.0%}" if completeness is not None else ""))
         print(f"  texts: {row['texts']}  fonts: {row['fonts']}")
+
+    if args.per_font_title:
+        from ctswag.fontid import discover_corpus
+        corpus = discover_corpus(args.fonts, min_weight=args.corpus_min_weight)
+        # Pick the first combo as the template (typically just one combo
+        # specified). We'll override font_overrides per font.
+        det, rec, ip, tr = combos[0]
+        print(f"\n=== per-font-title: sweeping {len(corpus)} fonts ===")
+        for k, fm in enumerate(corpus):
+            tag = f"font{k:02d}-{fm.family}{fm.weight}"
+            name = f"{det}_{rec}_{ip}_{tr}_{tag}"
+            print(f"\n[{k+1}/{len(corpus)}] {tag}")
+            cfg = PipelineConfig(
+                detector=det, recognizer=("tesseract" if rec == "synth" else rec),
+                inpainter=ip, tracer=tr,
+                font_corpus_dir=str(args.fonts), top_k_fonts=args.top_k_fonts,
+                refine_top_k=args.refine_top_k,
+                corpus_min_weight=args.corpus_min_weight,
+                text_overrides=args.text,
+                # Force BOTH texts to use this font so the comparison is
+                # apples-to-apples per font choice (a real logo would pair
+                # the title with a matching weight/family for the year).
+                font_overrides=[
+                    (fm.family, fm.weight, fm.ttf_path),
+                    (fm.family, fm.weight, fm.ttf_path),
+                ],
+                refine_force_arc=args.force_arc,
+            )
+            out_svg = args.out / name / "output.svg"
+            t_start = time.perf_counter()
+            try:
+                res = run(args.input, out_svg, cfg,
+                          badge=badge if det == "synth" else None)
+            except Exception:
+                print(traceback.format_exc(limit=4))
+                continue
+            wall = time.perf_counter() - t_start
+            try:
+                rendered = eval_mod.render_svg(out_svg, width=W, height=H)
+                mask = polygons_to_mask([t.polygon for t in res.texts],
+                                         (H, W), inflate_px=4)
+                m_all = eval_mod.metrics(original, rendered)
+                m_txt = eval_mod.metrics(original, rendered, mask=mask) if mask.any() else None
+            except Exception:
+                print(traceback.format_exc(limit=4))
+                continue
+            run_dir = eval_mod.save_run(
+                args.out, name, original=original, rendered=rendered,
+                metrics_overall=m_all, metrics_text=m_txt,
+                timings=res.timings, config=res.config,
+                texts=res.texts, font_matches=res.font_matches,
+            )
+            (run_dir / "output.svg").write_bytes(out_svg.read_bytes())
+            row = {
+                "name": name, "wall_s": wall,
+                "ssim": m_all["ssim"], "l1_255": m_all["l1_255"],
+                "ssim_text": m_txt["ssim"] if m_txt else None,
+                "l1_255_text": m_txt["l1_255"] if m_txt else None,
+                "completeness": None,
+                "texts": [t.text for t in res.texts],
+                "fonts": [(f.family, f.weight, round(f.score, 4))
+                          for f in res.font_matches],
+                "timings": res.timings,
+            }
+            leaderboard.append(row)
+            print(f"  wall {wall:.1f}s  ssim {m_all['ssim']:.3f}"
+                  f"  L1 {m_all['l1_255']:.2f}/255  fonts: {row['fonts']}")
 
     # Rank by (completeness desc, ssim desc): completeness is the gating criterion
     # for an editable-text deliverable; SSIM is the tiebreaker.

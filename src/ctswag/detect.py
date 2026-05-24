@@ -18,6 +18,63 @@ def have(mod: str) -> bool:
     return importlib.util.find_spec(mod) is not None
 
 
+# -- geometry-driven detection for camp-style badges ---------------------- #
+
+def detect_camp_geom(img_bgr: np.ndarray,
+                     *, arc_span_deg: float = 140.0,
+                     arc_outside_ratio: float = 0.10,
+                     title_height_ratio: float = 0.075,
+                     year_y_ratio: float = 0.08,
+                     year_height_ratio: float = 0.07) -> list[np.ndarray]:
+    """Camp-Tinker-style polygons derived from the badge's outer ring.
+
+    Use this when tesseract/easyocr miss arched text on a logo we already
+    understand the layout of. We locate the badge with Hough, then build
+    a polygon ringing the outer circle for the title, and an axis-aligned
+    rectangle below the badge for the year. Ratios are relative to the
+    image's short edge so they scale with input resolution.
+
+    Returns [title_arc_polygon, year_rect_polygon].
+    """
+    import math
+    from . import geom as geom_mod
+
+    badge = geom_mod.find_badge_center(img_bgr)
+    if badge is None:
+        return []
+    cx, cy, r_outer = badge
+    H, W = img_bgr.shape[:2]
+    short = float(min(H, W))
+
+    # Title sits on an arc just OUTSIDE the outer ring.
+    title_h = short * title_height_ratio
+    arc_r = r_outer + short * arc_outside_ratio
+    half_h = title_h * 0.6
+    arc_span = math.radians(arc_span_deg)
+    t0, t1 = -math.pi / 2 - arc_span / 2, -math.pi / 2 + arc_span / 2
+    n = 24
+    upper, lower = [], []
+    for i in range(n + 1):
+        t = t0 + (t1 - t0) * i / n
+        upper.append((cx + (arc_r + half_h) * math.cos(t),
+                      cy + (arc_r + half_h) * math.sin(t)))
+        lower.append((cx + (arc_r - half_h) * math.cos(t),
+                      cy + (arc_r - half_h) * math.sin(t)))
+    title_poly = np.array(upper + lower[::-1], dtype=np.float32)
+
+    # Year sits below the outer ring, centered on cx.
+    year_y = cy + r_outer + short * year_y_ratio
+    year_h = short * year_height_ratio
+    year_w = year_h * 1.8  # ~4 digits at ~0.5em width
+    year_poly = np.array([
+        [cx - year_w, year_y - year_h * 1.2],
+        [cx + year_w, year_y - year_h * 1.2],
+        [cx + year_w, year_y + year_h * 0.4],
+        [cx - year_w, year_y + year_h * 0.4],
+    ], dtype=np.float32)
+    return [title_poly, year_poly]
+
+
 # -- synthetic ground truth (uses synth.py geometry) ----------------------- #
 
 def detect_synth(img_bgr: np.ndarray, badge=None) -> list[np.ndarray]:
@@ -128,6 +185,7 @@ def detect_doctr(img_bgr: np.ndarray, predictor=None) -> list[np.ndarray]:
 
 REGISTRY: dict[str, Detector] = {
     "synth":     detect_synth,
+    "camp_geom": detect_camp_geom,
     "tesseract": detect_tesseract,
     "easyocr":   detect_easyocr,
     "doctr":     detect_doctr,

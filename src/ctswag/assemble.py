@@ -1,6 +1,7 @@
 """Assemble the final SVG: traced geometry as <path>, detected text as <text>."""
 from __future__ import annotations
 
+import base64
 import math
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -10,21 +11,95 @@ from lxml import etree
 from .types import DetectedText, FontMatch, TraceResult
 
 
+def _ttf_family_name(ttf_path: str) -> str | None:
+    """Return the font's family name as written in the TTF's `name` table.
+
+    Without this, the SVG carries our corpus-directory-derived name (e.g.
+    "BrandonGrotesque") but fontconfig knows the font by its TTF-table name
+    (e.g. "BrandonGrotesque-Bold"). rsvg-convert and other fontconfig-based
+    renderers fail to match the name we emit and silently fall back. Using
+    the TTF's real family name everywhere keeps the SVG portable.
+    """
+    try:
+        from fontTools.ttLib import TTFont
+    except Exception:
+        return None
+    try:
+        f = TTFont(ttf_path)
+        n = f["name"]
+        # Try the Windows English entry first, then Mac Roman.
+        rec = n.getName(1, 3, 1, 0x409) or n.getName(1, 1, 0, 0)
+        if rec is None:
+            return None
+        return rec.toUnicode()
+    except Exception:
+        return None
+
+
 SVG_NS = "http://www.w3.org/2000/svg"
 XLINK_NS = "http://www.w3.org/1999/xlink"
 
 
+def _font_face_css(fonts: list[FontMatch]) -> str:
+    """Build @font-face CSS rules embedding each used TTF as a base64
+    data-URL. The font-family in each rule matches what `font-family`
+    on the <text> elements uses (the TTF's real family name, see
+    _ttf_family_name), so:
+      * Browsers like Chrome use the embedded TTF via @font-face match.
+      * rsvg-convert (which ignores @font-face data URLs) instead loads
+        the same TTF by name through fontconfig -- we register
+        fonts_curated/ in a project-local fontconfig file at run time.
+    """
+    seen: set[tuple[str, str]] = set()
+    rules: list[str] = []
+    for fm in fonts:
+        if not fm or not fm.ttf_path:
+            continue
+        family = _ttf_family_name(fm.ttf_path) or fm.family
+        key = (family, fm.ttf_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            with open(fm.ttf_path, "rb") as f:
+                ttf_bytes = f.read()
+        except OSError:
+            continue
+        b64 = base64.b64encode(ttf_bytes).decode("ascii")
+        rules.append(
+            f"@font-face {{\n"
+            f"  font-family: '{family}';\n"
+            f"  font-weight: {fm.weight};\n"
+            f"  font-style: normal;\n"
+            f"  src: url(data:font/ttf;base64,{b64}) format('truetype');\n"
+            f"}}"
+        )
+    return "\n".join(rules)
+
+
 def _arc_path_d(cx: float, cy: float, r: float, t0: float, t1: float) -> str:
-    """Build an SVG arc path from (cx,cy,r) and angle endpoints in radians."""
-    # Make sure we go CCW from t0 to t1 along the upper arc.
-    if t1 < t0:
-        t1 += 2 * math.pi
+    """Build an SVG arc path from (cx,cy,r) and angle endpoints in radians.
+
+    Always picks the SHORT arc between the two endpoints (large_arc=0). The
+    sweep flag is chosen so the path is traversed in the direction of
+    increasing parameter t (top arcs run left->right with increasing theta;
+    bottom arcs run left->right with DECREASING theta, so they need
+    sweep=0). Calling code orders (t0, t1) so the FIRST point is the text's
+    leftmost end -- the textPath then lays glyphs in reading order.
+    """
+    # Normalize delta to (-pi, pi] so we know whether t0->t1 sweeps in the
+    # positive (sweep=1, CW in image coords) or negative direction.
+    delta = t1 - t0
+    while delta > math.pi:
+        delta -= 2 * math.pi
+    while delta <= -math.pi:
+        delta += 2 * math.pi
+    sweep = 1 if delta > 0 else 0
+    large_arc = 0
     x0 = cx + r * math.cos(t0)
     y0 = cy + r * math.sin(t0)
     x1 = cx + r * math.cos(t1)
     y1 = cy + r * math.sin(t1)
-    large_arc = 1 if abs(t1 - t0) > math.pi else 0
-    sweep = 1
     return f"M {x0:.2f} {y0:.2f} A {r:.2f} {r:.2f} 0 {large_arc} {sweep} {x1:.2f} {y1:.2f}"
 
 
@@ -32,7 +107,9 @@ def assemble(trace: TraceResult,
              texts: list[DetectedText],
              fonts: list[FontMatch],
              *,
-             output_path: Path | str) -> Path:
+             output_path: Path | str,
+             circles: list[tuple[float, float, float]] | None = None,
+             circle_widths: list[float] | None = None) -> Path:
     nsmap = {None: SVG_NS, "xlink": XLINK_NS}
     svg = etree.Element("svg", nsmap=nsmap)
     svg.set("viewBox", f"0 0 {trace.width} {trace.height}")
@@ -41,13 +118,30 @@ def assemble(trace: TraceResult,
 
     defs = etree.SubElement(svg, "defs")
 
+    # Embed each used font as a base64 @font-face so any renderer draws the
+    # actual font without needing it installed. Without this, browsers fall
+    # back to a default sans (or serif!) while cairosvg, which finds the
+    # TTF via fontconfig in the project, renders correctly -- producing a
+    # mismatch between the live SVG and the render.png.
+    font_css = _font_face_css(fonts)
+    if font_css:
+        style = etree.SubElement(defs, "style")
+        style.set("type", "text/css")
+        style.text = font_css
+
     # Background white rect (so the file rasterizes against white explicitly)
     bg = etree.SubElement(svg, "rect")
     bg.set("width", str(trace.width))
     bg.set("height", str(trace.height))
     bg.set("fill", "white")
 
-    # Geometry
+    # Geometry FIRST so the rings render on top of it. In the source, the
+    # tips of line-art strokes (sun rays, mountain ridges, the baseline)
+    # actually continue a few pixels under the ring's stroke -- visually
+    # they "end at the ring" but the ink continues hidden beneath. Painting
+    # the ring on top reproduces that, and also hides any sub-pixel
+    # anti-alias halo from the ring's edges that vtracer might trace as
+    # faint fragments.
     geom = etree.SubElement(svg, "g")
     geom.set("id", "geometry")
     geom.set("fill", "black")
@@ -67,11 +161,35 @@ def assemble(trace: TraceResult,
             p = etree.SubElement(geom, "path")
             p.set("d", path_tag)
 
+    # Rings on top of geometry. See note above the geometry block.
+    # The drawn stroke-width is the detected stroke + 1 px: cairosvg's AA
+    # under-covers pixels at the very inner/outer edge of a stroked circle
+    # by ~0.5 px on each side, which would leave a 1-px halo between the
+    # line art (vtracer-traced) and the SVG ring. The +1 px overhang
+    # closes that halo without visibly changing the ring's thickness.
+    if circles:
+        ring_g = etree.SubElement(svg, "g")
+        ring_g.set("id", "rings")
+        ring_g.set("fill", "none")
+        ring_g.set("stroke", "black")
+        widths = circle_widths or [6.0] * len(circles)
+        for (cx, cy, r), w in zip(circles, widths):
+            c = etree.SubElement(ring_g, "circle")
+            c.set("cx", f"{cx:.2f}")
+            c.set("cy", f"{cy:.2f}")
+            c.set("r", f"{r:.2f}")
+            c.set("stroke-width", f"{w + 1.0:.2f}")
+
     # Text
     text_g = etree.SubElement(svg, "g")
     text_g.set("id", "text")
     for i, (dt, fm) in enumerate(zip(texts, fonts)):
-        family = fm.family if fm else "sans-serif"
+        # Use the TTF's REAL family name (from its `name` table) so
+        # fontconfig-based renderers (rsvg-convert, Inkscape) can resolve
+        # the font. The @font-face block above declares the same name with
+        # the TTF embedded as a data URL for browsers.
+        family = ((_ttf_family_name(fm.ttf_path) if fm and fm.ttf_path else None)
+                   or (fm.family if fm else "sans-serif"))
         weight = str(fm.weight) if fm else "700"
         size = f"{fm.size_px:.2f}" if fm and fm.size_px else "48"
         ls_em = fm.letter_spacing_em if fm else 0.0

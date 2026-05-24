@@ -3,4 +3,12 @@ __pycache__/
 *.pyc
 *.egg-info/
 runs/
+runs_*/
 .cache/
+.claude/
+.fontconfig/
+.DS_Store
+debug*.html
+.camp_tinker_synth.rendered.png
+# Throwaway probes for one-off investigations (kept out of repo).
+scripts/_*.py

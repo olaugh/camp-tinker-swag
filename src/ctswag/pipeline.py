@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from . import baseline as baseline_mod
+from . import circles as circles_mod
 from . import detect as detect_mod
 from . import fontid as fontid_mod
 from . import geom as geom_mod
@@ -17,10 +18,12 @@ from . import inpaint as inpaint_mod
 from . import merge as merge_mod
 from . import optimize as optimize_mod
 from . import recognize as recognize_mod
+from . import skeleton as skeleton_mod
+from . import snap_strokes as snap_strokes_mod
 from . import trace as trace_mod
 from . import unwarp as unwarp_mod
 from .assemble import assemble
-from .types import Baseline, DetectedText, FontMatch, PipelineResult
+from .types import Baseline, DetectedText, FontMatch, PipelineResult, TraceResult
 
 
 @dataclass
@@ -39,9 +42,31 @@ class PipelineConfig:
     refine_try_arc: bool = True       # For "line" baselines, also sweep arc radii
     refine_force_arc: bool = False    # Force every text to use an arc baseline
     corpus_min_weight: int = 0        # Drop TTFs lighter than this (700=bold)
+    detect_circles: bool = True       # HoughCircles ring detection -> <circle>
+    # Off by default: the skeleton path replaces vtracer's filled-Bezier
+    # outlines with single-centerline <line>/<polyline> elements per stroke,
+    # which fixes specific vtracer artifacts (e.g. waterfall ticks getting
+    # rendered as inverted "T"s where they brush the mountain baseline) but
+    # introduces discontinuities at junctions and faceted curves where the
+    # source had smooth ones (sun semicircle). Enable when you specifically
+    # want the cleaner per-stroke SVG structure; vtracer is the default
+    # because its raster fidelity is currently better.
+    use_skeleton_for_inside: bool = False
+    # Post-vtracer: for paths whose bbox is below the mountain-baseline
+    # horizon AND are tall-narrow AND whose PCA major-axis is within this
+    # many degrees of vertical, snap to an exactly-vertical <line>. Picks
+    # up the rounded-tip waterfall ticks (the source draws them strictly
+    # vertical but vtracer's trace lands a few degrees off). Set to 0 to
+    # disable. Only applies to inside-the-rings paths.
+    vertical_snap_tolerance_deg: float = 8.0
     # If provided, skip OCR entirely and assign these strings to detected
     # polygons in top-to-bottom order. Same length as expected polygon count.
     text_overrides: list[str] | None = None
+    # If provided, skip font-ID for the i-th text and use this (family, weight,
+    # ttf_path) directly. Same top-to-bottom ordering as text_overrides.
+    # None entries fall through to font-ID. Useful for debugging a specific
+    # font hypothesis side-by-side with the auto-picked answer.
+    font_overrides: list[tuple[str, int, str] | None] | None = None
 
 
 def _crop_polygon(img: np.ndarray, polygon: np.ndarray,
@@ -92,6 +117,61 @@ def run(input_path: Path | str,
     polygons = det_fn(img_bgr, **kw)
     timings["detect"] = time.perf_counter() - t0
 
+    # 1b. detect rings early so we can use the badge geometry to measure
+    # text bands. Detector polygons (camp_geom) use hardcoded radius/height
+    # ratios; the actual text in the source sits at radii we can simply
+    # measure once we know the outer ring's position. This call's result is
+    # cached in `found_circles` / `circle_widths` and reused at the inpaint
+    # stage below -- no duplicate detection.
+    found_circles: list[tuple[float, float, float]] = []
+    circle_widths: list[float] = []
+    if cfg.detect_circles:
+        t0 = time.perf_counter()
+        rings = circles_mod.detect_with_strokes(img_bgr)
+        found_circles = [(cx, cy, r) for (cx, cy, r, _w) in rings]
+        circle_widths = [w for (_cx, _cy, _r, w) in rings]
+        timings["circles"] = time.perf_counter() - t0
+        out.config["circles"] = [
+            {"cx": cx, "cy": cy, "r": r, "stroke_width": w}
+            for (cx, cy, r), w in zip(found_circles, circle_widths)
+        ]
+
+    # 1c. measure text bands and replace detector polygons with the actual
+    # arc-shaped bands the text occupies. Each polygon is matched to a
+    # measured band by angular centroid; polygons with no nearby band keep
+    # the detector's geometry as a fallback.
+    if found_circles:
+        outer_cx, outer_cy, outer_r = found_circles[0]
+        outer_sw = circle_widths[0]
+        bands = geom_mod.measure_text_bands(
+            img_bgr, outer_cx, outer_cy, outer_r, outer_sw)
+        measured_baselines: list[Baseline | None] = [None] * len(polygons)
+        if bands and polygons:
+            import math as _math
+            new_polygons: list[np.ndarray] = []
+            for i, poly in enumerate(polygons):
+                py_cx = float(poly[:, 0].mean())
+                py_cy = float(poly[:, 1].mean())
+                poly_theta = _math.atan2(py_cy - outer_cy, py_cx - outer_cx)
+                best_band: dict | None = None
+                best_dist = _math.inf
+                for band in bands:
+                    band_mid = (band["theta_min"] + band["theta_max"]) / 2.0
+                    d = ((poly_theta - band_mid + _math.pi)
+                         % (2 * _math.pi)) - _math.pi
+                    if abs(d) < best_dist:
+                        best_dist = abs(d)
+                        best_band = band
+                if best_band is not None and best_dist < _math.radians(30.0):
+                    new_polygons.append(geom_mod.band_to_polygon(best_band))
+                    measured_baselines[i] = geom_mod.band_to_baseline(best_band)
+                else:
+                    new_polygons.append(poly)
+            polygons = new_polygons
+        out.config["text_bands"] = bands
+    else:
+        measured_baselines = [None] * len(polygons)
+
     # 2. recognize + baseline + crop, per polygon
     t0 = time.perf_counter()
     pre_texts: list[str] = []
@@ -121,8 +201,15 @@ def run(input_path: Path | str,
 
     # Scale arc-residual threshold to image size: 1% of the short edge.
     short_edge = float(min(H, W))
-    merged = merge_mod.maybe_merge(pre_polys, pre_texts,
-                                   residual_threshold=max(8.0, 0.01 * short_edge))
+    has_measured = any(mbl is not None for mbl in measured_baselines)
+    if has_measured and cfg.text_overrides is not None:
+        # Skip merger: each polygon already represents one complete text
+        # region and we have a measured baseline for it. Going through the
+        # merger would lose the per-polygon baseline mapping.
+        merged = list(zip(pre_polys, pre_texts, measured_baselines))
+    else:
+        merged = merge_mod.maybe_merge(pre_polys, pre_texts,
+                                       residual_threshold=max(8.0, 0.01 * short_edge))
 
     # If text was overridden, assign expected strings by polygon-centroid Y
     # (top-to-bottom).
@@ -146,8 +233,13 @@ def run(input_path: Path | str,
         if crop.size == 0:
             continue
         # If joined_text came out empty (because pre-pass found nothing on a
-        # raw curved crop), re-run recognition on the unwarped joined crop.
+        # raw curved crop), re-run recognition on the unwarped joined crop --
+        # unless we're in text-override mode, in which case any unlabeled
+        # polygon is an extra detection (likely a false positive) and we
+        # drop it rather than invent OCR for it.
         if not joined_text:
+            if cfg.text_overrides is not None:
+                continue
             text, conf = rec_fn(crop[:, :, ::-1])
             joined_text = "".join(c for c in text if c.isalnum() or c.isspace()).strip().upper()
             confidence = float(conf)
@@ -165,20 +257,32 @@ def run(input_path: Path | str,
                                         min_weight=cfg.corpus_min_weight)
     matches: list[FontMatch] = []
     candidates_per_text: list[list[FontMatch]] = []
-    for dt in texts:
+    for i, dt in enumerate(texts):
         if not dt.text or not corpus:
             matches.append(FontMatch(family="sans-serif", weight=700))
             candidates_per_text.append([])
             continue
-        gray = cv2.cvtColor(dt.crop, cv2.COLOR_BGR2GRAY)
-        top_k = max(cfg.top_k_fonts, cfg.refine_top_k if cfg.refine else 0)
-        # When refining, skip the per-candidate letter-spacing sweep at the
-        # font-ID stage: the optimizer will do a more thorough sweep on the
-        # finalists (size, ls, dx, dy, baseline) so we just need a top-K.
-        candidates = fontid_mod.match(gray, dt.text, corpus, top_k=top_k,
-                                      skip_fine=cfg.refine)
-        candidates_per_text.append(candidates)
-        best = candidates[0] if candidates else FontMatch(family="sans-serif", weight=700)
+        # Font override -- forces a specific (family, weight, ttf) for this
+        # text slot, skipping the search. The optimizer still sweeps size/dx/dy
+        # for the override, so the placement is still tuned to the source.
+        override = (cfg.font_overrides[i]
+                    if cfg.font_overrides and i < len(cfg.font_overrides)
+                    else None)
+        if override is not None:
+            fam, wt, ttf = override
+            forced = FontMatch(family=fam, weight=wt, ttf_path=ttf)
+            candidates_per_text.append([forced])
+            best = forced
+        else:
+            gray = cv2.cvtColor(dt.crop, cv2.COLOR_BGR2GRAY)
+            top_k = max(cfg.top_k_fonts, cfg.refine_top_k if cfg.refine else 0)
+            # When refining, skip the per-candidate letter-spacing sweep at the
+            # font-ID stage: the optimizer will do a more thorough sweep on the
+            # finalists (size, ls, dx, dy, baseline) so we just need a top-K.
+            candidates = fontid_mod.match(gray, dt.text, corpus, top_k=top_k,
+                                          skip_fine=cfg.refine)
+            candidates_per_text.append(candidates)
+            best = candidates[0] if candidates else FontMatch(family="sans-serif", weight=700)
         # Re-record a sensible size for assembly.
         # The polygon's y-extent is wrong for both arched (arc sag) and tilted
         # rectangles (rotated, axis-aligned bbox is huge). Use:
@@ -246,16 +350,100 @@ def run(input_path: Path | str,
     residual = inp_fn(img_bgr, mask)
     timings["inpaint"] = time.perf_counter() - t0
 
-    # 5. trace
+    # 4b. paint the rings white in the residual so vtracer doesn't re-trace
+    # them as wobbly Beziers alongside our clean <circle> elements; then
+    # paint EVERYTHING outside the outer ring white (text and any other
+    # non-badge ink). Circles were already detected at step 1b on the
+    # original image -- reuse those results, no duplicate detection.
+    if found_circles:
+        t0 = time.perf_counter()
+        residual = circles_mod.paint_white(residual, found_circles, circle_widths)
+        outer_cx, outer_cy, outer_r = found_circles[0]
+        outer_sw = circle_widths[0]
+        yy_idx, xx_idx = np.mgrid[0:H, 0:W]
+        outside_outer = (np.hypot(xx_idx - outer_cx, yy_idx - outer_cy)
+                          > (outer_r + outer_sw / 2.0 + 2.0))
+        if residual.ndim == 3:
+            residual[outside_outer] = 255
+        else:
+            residual[outside_outer] = 255
+        timings["paint_rings"] = time.perf_counter() - t0
+
+    # 5. trace -- either vtracer (filled Bezier contours) or skeleton-based
+    # (one <line>/<polyline> per centerline). Skeleton is the default for
+    # inside-the-rings geometry on this kind of badge: it preserves stroke
+    # constraints (fixed width, axis-aligned tree trunks / mountain base /
+    # waterfall ticks) that vtracer can't express. The vtracer path is kept
+    # as a fallback for designs the skeleton approach doesn't handle.
     t0 = time.perf_counter()
-    tr_fn = trace_mod.REGISTRY[cfg.tracer]
-    trace = tr_fn(residual, **cfg.tracer_kwargs)
+    if cfg.use_skeleton_for_inside and found_circles:
+        inner = min(zip(found_circles, circle_widths), key=lambda c: c[0][2])
+        (inner_cx, inner_cy, inner_r), inner_sw = inner
+        gray = (cv2.cvtColor(residual, cv2.COLOR_BGR2GRAY)
+                if residual.ndim == 3 else residual)
+        yy_idx, xx_idx = np.mgrid[0:H, 0:W]
+        inside_mask = (np.hypot(xx_idx - inner_cx, yy_idx - inner_cy)
+                        < (inner_r - inner_sw / 2.0 - 2.0))
+        binary = (gray < 128) & inside_mask
+        skel = skeleton_mod.skeletonize_binary(binary)
+        skel = skeleton_mod.prune_spurs(
+            skel, max_spur_len=max(int(round(inner_sw)), 8))
+        skel, _ = skeleton_mod.straighten_segments(skel)
+        skel, _ = skeleton_mod.snap_to_ring(
+            skel, inner_cx, inner_cy, inner_r - inner_sw / 2.0,
+            max_gap=25.0)
+        paths = skeleton_mod.skeleton_to_svg_paths(
+            skel, stroke_width=inner_sw)
+        trace = TraceResult(svg_paths=paths, width=W, height=H)
+    else:
+        tr_fn = trace_mod.REGISTRY[cfg.tracer]
+        trace = tr_fn(residual, **cfg.tracer_kwargs)
     timings["trace"] = time.perf_counter() - t0
+
+    # 5b. Vertical-snap below horizon: clean up the waterfall ticks vtracer
+    # leaves tilted a few degrees off vertical. Only kicks in for tall-narrow
+    # paths below the detected horizon (mountain baseline) and only when
+    # their PCA axis is within tolerance.
+    if (cfg.vertical_snap_tolerance_deg > 0 and found_circles
+            and trace.svg_paths):
+        t0 = time.perf_counter()
+        (outer_cx2, outer_cy2, outer_r2) = found_circles[0]
+        inner_r2 = found_circles[-1][2] if len(found_circles) > 1 else outer_r2
+        gray_residual = (cv2.cvtColor(residual, cv2.COLOR_BGR2GRAY)
+                         if residual.ndim == 3 else residual)
+        horizon_y = snap_strokes_mod.detect_horizon_y(
+            gray_residual, outer_cx2, outer_cy2, inner_r2)
+        if horizon_y is not None:
+            debug_records: list[dict] = []
+            trace = TraceResult(
+                svg_paths=snap_strokes_mod.snap_vertical_below_horizon(
+                    trace.svg_paths, horizon_y,
+                    tolerance_deg=cfg.vertical_snap_tolerance_deg,
+                    debug_records=debug_records),
+                width=trace.width, height=trace.height,
+            )
+            out.config["horizon_y"] = float(horizon_y)
+            out.config["snap_debug"] = debug_records
+            # Save a debug overlay PNG next to the SVG so build_debug_page
+            # can surface it. backdrop is the inpainted/painted residual --
+            # what vtracer actually saw, so the bbox positions overlay
+            # cleanly on the input the snap was reasoning about.
+            out_dir = Path(output_path).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            overlay = snap_strokes_mod.render_debug_overlay(
+                debug_records,
+                img_bgr,
+                horizon_y=horizon_y,
+            )
+            cv2.imwrite(str(out_dir / "snap_debug.png"), overlay)
+        timings["snap_vertical"] = time.perf_counter() - t0
+
     out.trace = trace
 
     # 6. assemble
     t0 = time.perf_counter()
-    assemble(trace, texts, matches, output_path=output_path)
+    assemble(trace, texts, matches, output_path=output_path,
+             circles=found_circles, circle_widths=circle_widths)
     timings["assemble"] = time.perf_counter() - t0
     timings["total"] = sum(timings.values())
     return out

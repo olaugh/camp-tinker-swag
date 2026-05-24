@@ -171,8 +171,11 @@ def _eval_params_arc(text: str, ttf_path: str, size_px: float,
                      full_h: int, full_w: int,
                      max_text_w: float = float("inf")) -> float:
     """Render the text on its arc inside `viewport` and return composite loss."""
-    # Cheap pre-check: if the rendered string would overflow `max_text_w`, drop
-    # immediately rather than render and find out the canvas truncated it.
+    # Cheap pre-checks: reject any (size, ls, dx) combo whose rendered text
+    # would either be too wide for the arc, OR be wide-enough plus shifted-far-
+    # enough that the dx shift pushes one end of the text past the arc's
+    # endpoint. Either case bakes truncated/wrapped-past-end text into the
+    # SVG and the loss can't see it.
     try:
         f = ImageFont.truetype(ttf_path, max(int(round(size_px)), 8))
         _, total_w, _, _ = _measure_run(text, f, ls)
@@ -181,6 +184,14 @@ def _eval_params_arc(text: str, ttf_path: str, size_px: float,
     except Exception:
         return float("inf")
     cx, cy, r, _t0, _t1 = baseline.params
+    arc_len = abs(_t1 - _t0) * r
+    # No safety margin -- resvg renders text NARROWER than PIL's per-glyph-
+    # bbox sum (BG 0.97x, Oswald 0.87x, Barlow 0.97x), so PIL >= actual.
+    # Reject any combo where dx pushes the rendered text past the path's
+    # endpoint at PIL's width; resvg will only render NARROWER and so will
+    # fit by at least the same margin.
+    if arc_len > 0 and abs(dx) + total_w / 2.0 > arc_len / 2.0:
+        return float("inf")
     rendered = render_arc_text(full_h, full_w, text, ttf_path, size_px,
                                cx, cy, r, letter_spacing_px=ls, dy=dy, dx=dx)
     x0, y0, x1, y1 = viewport
@@ -213,8 +224,8 @@ def _eval_params_line(text: str, ttf_path: str, size_px: float,
 
 def sweep(dt: DetectedText, candidates: list[FontMatch],
           source_img_bgr: np.ndarray,
-          *, n_size: int = 5, n_dy: int = 5, n_ls: int = 3,
-          n_dx: int = 5,
+          *, n_size: int = 5, n_dy: int = 5, n_ls: int = 4,
+          n_dx: int = 4,
           try_arc_for_line: bool = True,
           force_arc: bool = False,
           arc_centers_hint: list[tuple[float, float]] | None = None,
@@ -238,11 +249,17 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
         return candidates[0], {}, None
 
     initial_size = candidates[0].size_px if candidates[0].size_px else 64.0
-    # Tightened so the search can't pick a font 30% taller than the source
-    # by relying on letter-spacing to fill the width.
-    size_range = (initial_size * 0.80, initial_size * 1.10)
+    # Wider downward range than upward because the band-measurement-derived
+    # `size_px` estimate is an UPPER bound (it captures the band's full
+    # radial extent, which includes the arc-rotation projection of letters
+    # off-tangent at the band's ends -- the source's actual cap-height is
+    # smaller). Going to 0.50x lets the optimizer find a shorter, denser
+    # rendering that matches a heavier source font.
+    size_range = (initial_size * 0.50, initial_size * 1.10)
     sizes = np.linspace(size_range[0], size_range[1], n_size)
-    lss = np.linspace(0, initial_size * 0.12, n_ls)
+    # Letter-spacing up to 30% of the chosen size: heavy/wide fonts in the
+    # source often have visible tracking that we need room to reproduce.
+    lss = np.linspace(0, initial_size * 0.30, n_ls)
 
     # Build a set of candidate baselines to try.
     candidate_baselines: list[Baseline] = []
@@ -260,18 +277,25 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
             # The caller gave us known arc centers (e.g. the badge's). Sweep
             # only the radius from that center to the polygon centroid, +-
             # a small offset, so the arc stays concentric with the badge.
+            # Range tightened to +/- 8% because outside that we routinely
+            # picked huge arcs (r >> badge radius) that flatten the textPath
+            # into a horizontal line across the middle of the image.
             for hcx, hcy in arc_centers_hint:
                 r_baseline = float(np.hypot(cx_p - hcx, cy_p - hcy))
-                for r_mult in (0.85, 0.92, 1.0, 1.08, 1.15):
+                for r_mult in (0.92, 0.96, 1.0, 1.04, 1.08):
                     r_arc = r_baseline * r_mult
                     candidate_baselines.append(
                         Baseline(kind="arc",
                                  params=(float(hcx), float(hcy), r_arc, 0.0, 0.0),
                                  residual=0.0)
                     )
-        if try_arc_for_line or force_arc:
+        if (try_arc_for_line or force_arc) and not arc_centers_hint:
             # Fallback: synth a few candidate concave-up arcs whose center
-            # sits below the polygon. Used when no badge hint is available.
+            # sits below the polygon. Only used when no badge hint is
+            # available -- with a hint, the concentric arcs above are the
+            # right answer and these wide synthesised arcs only create
+            # opportunities for the loss to be gamed by joke fonts that
+            # happen to score well on a flat 4x-text-width radius.
             ks = (1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0) if force_arc else (1.5, 2.5, 4.0, 8.0)
             for k in ks:
                 cy_arc = cy_p + k * text_w / 2
@@ -284,31 +308,50 @@ def sweep(dt: DetectedText, candidates: list[FontMatch],
 
     text = dt.text or ""
 
-    # Hard upper bound on rendered text width: ~115% of the source polygon's
-    # x-extent (or arc chord length for arc baselines). Forbids the optimizer
-    # picking a font/size combo whose rendered text overflows -- without this,
-    # overflow that falls past the canvas edge isn't scored and the loss
-    # silently rewards huge fonts.
+    # Hard upper bound on rendered text width: for arc baselines, the actual
+    # arc length at the baseline radius -- not the polygon's x-extent, which
+    # is based on the OUTER edge of the band and so is wider than the arc
+    # the text actually sits on. Without using the baseline arc length, the
+    # optimizer can land on a size/letter-spacing combo whose text overflows
+    # the path and wraps past its endpoint (the last character then renders
+    # straight, off the badge).
     poly_w = float(dt.polygon[:, 0].max() - dt.polygon[:, 0].min())
-    max_text_w = poly_w * 1.15
+    max_text_w_line = poly_w * 1.15
+
+    def _arc_max_w(baseline: Baseline) -> float:
+        _cx, _cy, _r, _t0, _t1 = baseline.params
+        delta = abs(_t1 - _t0)
+        # No safety margin. We now render through resvg which produces text
+        # narrower than PIL's per-glyph-bbox sum (BG ratio 0.97, Oswald 0.87,
+        # Barlow 0.97). So if PIL says width <= arc_len, resvg's rendering
+        # will also fit. The earlier 0.85 margin was sized for cairosvg
+        # which renders wider; with that gone the optimizer can pick wider
+        # letter-spacing or larger sizes that previously got rejected.
+        return float(_r) * float(delta)
 
     def render_with(baseline: Baseline, ttf: str, s: float, dy: float,
                     dx: float, ls: float) -> float:
         if baseline.kind == "arc":
             return _eval_params_arc(text, ttf, s, baseline, dy, dx, ls,
                                     crop, viewport, H, W,
-                                    max_text_w=max_text_w)
+                                    max_text_w=_arc_max_w(baseline))
         line_x = float(dt.polygon[:, 0].mean())
         line_y = float(dt.polygon[:, 1].max()) - s * 0.18
         return _eval_params_line(text, ttf, s, line_x + dx, line_y + dy, ls,
                                  crop, viewport, H, W,
-                                 max_text_w=max_text_w)
+                                 max_text_w=max_text_w_line)
 
-    # Per-baseline displacement ranges
+    # Per-baseline displacement ranges. dy on an arc baseline shifts the
+    # ARC CENTER vertically -- equivalent to shifting the baseline radius
+    # (text moves radially in/out). Range is tight (±2% of r ≈ ±15 px)
+    # because the arc baseline comes from a direct geometric measurement
+    # of the text band; the optimizer just needs sub-pixel correction, not
+    # gross re-positioning. Wider ranges let the optimizer pull text into
+    # the badge interior to overlap unrelated ink (rings, sun rays).
     def ranges(baseline: Baseline) -> tuple[np.ndarray, np.ndarray]:
         if baseline.kind == "arc":
             r0 = baseline.params[2]
-            dys_b = np.linspace(-r0 * 0.05, r0 * 0.05, n_dy)
+            dys_b = np.linspace(-r0 * 0.02, r0 * 0.02, n_dy)
             dxs_b = np.linspace(-initial_size * 0.6, initial_size * 0.6, n_dx)
         else:
             dys_b = np.linspace(-initial_size * 0.3, initial_size * 0.3, n_dy)

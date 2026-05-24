@@ -19,19 +19,22 @@ from skimage.metrics import structural_similarity as ssim
 from .types import FontMatch
 
 
-# Pull weight from filename like "montserrat-700.ttf"
-_WEIGHT_RE = re.compile(r"-(\d{3})\.ttf$", re.IGNORECASE)
+# Pull weight from filename like "montserrat-700.ttf" or "afta-sans-400.otf".
+_WEIGHT_RE = re.compile(r"-(\d{3})\.(?:ttf|otf)$", re.IGNORECASE)
 
 
 def discover_corpus(root: Path | str, *, min_weight: int = 0) -> list[FontMatch]:
-    """Walk fonts/ and produce a FontMatch entry per TTF.
+    """Walk fonts/ and produce a FontMatch entry per font file (TTF or OTF).
 
-    min_weight: drop any TTF whose weight (parsed from the filename suffix)
+    min_weight: drop any font whose weight (parsed from the filename suffix)
     is below this threshold. 700 = bold, 800 = extrabold.
     """
     root = Path(root)
     out: list[FontMatch] = []
-    for ttf in sorted(root.rglob("*.ttf")):
+    files = sorted(
+        list(root.rglob("*.ttf")) + list(root.rglob("*.otf"))
+    )
+    for ttf in files:
         family = ttf.parent.name
         m = _WEIGHT_RE.search(ttf.name)
         weight = int(m.group(1)) if m else 400
@@ -223,12 +226,12 @@ def match(crop_gray: np.ndarray, text: str,
         out.sort(key=lambda fm: fm.score)
         return out
 
-    # Stage 1: coarse pass (single spacing)
-    if len(corpus_list) > coarse_k:
-        coarse = run(corpus_list, spacings=(0.0,))
-        finalists = coarse[:coarse_k]
-    else:
-        finalists = corpus_list
+    # Stage 1: coarse pass (single spacing). For small corpora we still
+    # run the coarse scoring -- skipping straight to corpus_list[:top_k]
+    # would return alphabetically-first entries with score=inf, which the
+    # downstream optimizer then "picks" without ever comparing alternatives.
+    coarse = run(corpus_list, spacings=(0.0,))
+    finalists = coarse[:min(coarse_k, len(corpus_list))]
     if skip_fine:
         return finalists[:top_k]
     # Stage 2: fine pass over finalists with full spacing sweep
