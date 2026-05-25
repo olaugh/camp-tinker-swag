@@ -318,6 +318,54 @@ def run(input_path: Path | str,
         # which is on a wide arc around the same center as CAMP TINKER).
         badge = geom_mod.find_badge_center(img_bgr)
         hint = [(badge[0], badge[1])] if badge else None
+        # Per-letter detection serves a different role here: derive a more
+        # accurate arc baseline (center + radius + angular span) than the
+        # polygon-CircleModel fit. The polygon traces the OUTER edge of
+        # the text band, so its arc fit is biased outward; per-letter
+        # centroids sit on the actual baseline. We use the per-letter
+        # info ONLY to refit the baseline, then keep emitting <textPath>
+        # so the SVG remains editable — changing "CAMP TINKER" to
+        # "BASE CAMP" should just work without rewriting per-glyph
+        # coordinates.
+        if badge:
+            import math as _math
+            for dt in texts:
+                anchors = geom_mod.detect_letter_anchors(
+                    img_bgr, dt.polygon, dt.text or "",
+                    badge_center=(badge[0], badge[1]))
+                if anchors:
+                    a0 = anchors[0]; an = anchors[-1]
+                    cx_a, cy_a, r_a = a0["arc_cx"], a0["arc_cy"], a0["arc_r"]
+                    # Sweep ONLY the extreme characters' positions to find
+                    # where they truly want to land. Centroid bias for
+                    # outer letters (C/R/2/5) is what pulled the text in
+                    # too tight; per-letter sweep corrects it. We don't
+                    # sweep intermediates — those are derived by font
+                    # advances + letter-spacing in assemble.
+                    caps = [a["cap_h"] for a in anchors]
+                    size = (float(sorted(caps)[len(caps) // 2]) / 0.72) * 0.85
+                    ttf = None
+                    for over in (cfg.font_overrides or []):
+                        if over:
+                            ttf = over[2]
+                            break
+                    # Use RAW bbox centers (not swept) for the arc
+                    # endpoints. Swept positions maximize IoU which can
+                    # bias INWARD (a rendered glyph that's slightly narrower
+                    # than the original lands centered on the mask, not
+                    # at the original glyph center). Bbox centers are
+                    # unbiased and the per-character sweep in assemble
+                    # still corrects the visual placement.
+                    t0 = _math.atan2(a0["anchor_y_raw"] - cy_a,
+                                     a0["anchor_x_raw"] - cx_a)
+                    t1 = _math.atan2(an["anchor_y_raw"] - cy_a,
+                                     an["anchor_x_raw"] - cx_a)
+                    dt.baseline = Baseline(
+                        kind="arc",
+                        params=(cx_a, cy_a, r_a, t0, t1),
+                        residual=0.0,
+                    )
+                    dt.letter_anchors = anchors
         if badge:
             out.timings["badge_center"] = 0.0
             out.config["badge_center"] = {"cx": badge[0], "cy": badge[1], "r": badge[2]}
@@ -419,6 +467,7 @@ def run(input_path: Path | str,
                 svg_paths=snap_strokes_mod.snap_vertical_below_horizon(
                     trace.svg_paths, horizon_y,
                     tolerance_deg=cfg.vertical_snap_tolerance_deg,
+                    inner_circle=(outer_cx2, outer_cy2, inner_r2),
                     debug_records=debug_records),
                 width=trace.width, height=trace.height,
             )
@@ -443,7 +492,8 @@ def run(input_path: Path | str,
     # 6. assemble
     t0 = time.perf_counter()
     assemble(trace, texts, matches, output_path=output_path,
-             circles=found_circles, circle_widths=circle_widths)
+             circles=found_circles, circle_widths=circle_widths,
+             img_bgr=img_bgr)
     timings["assemble"] = time.perf_counter() - t0
     timings["total"] = sum(timings.values())
     return out

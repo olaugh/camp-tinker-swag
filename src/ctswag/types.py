@@ -24,6 +24,12 @@ class DetectedText:
     confidence: float              # detector or recognizer confidence
     baseline: Baseline | None = None
     crop: np.ndarray | None = None # tight RGB(A) crop covering the polygon
+    # Per-character anchors detected from the input image: one dict per
+    # non-space character, with keys "x", "y" (bbox-center anchor),
+    # "rot_deg" (tangent rotation), "cap_h" (measured cap height). When
+    # present, assemble emits per-letter <text> elements instead of
+    # <textPath>.
+    letter_anchors: list[dict] | None = None
 
     @property
     def bbox(self) -> tuple[int, int, int, int]:

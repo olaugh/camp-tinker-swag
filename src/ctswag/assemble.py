@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+import numpy as np
 from lxml import etree
 
 from .types import DetectedText, FontMatch, TraceResult
@@ -109,7 +110,8 @@ def assemble(trace: TraceResult,
              *,
              output_path: Path | str,
              circles: list[tuple[float, float, float]] | None = None,
-             circle_widths: list[float] | None = None) -> Path:
+             circle_widths: list[float] | None = None,
+             img_bgr: np.ndarray | None = None) -> Path:
     nsmap = {None: SVG_NS, "xlink": XLINK_NS}
     svg = etree.Element("svg", nsmap=nsmap)
     svg.set("viewBox", f"0 0 {trace.width} {trace.height}")
@@ -146,16 +148,25 @@ def assemble(trace: TraceResult,
     geom.set("id", "geometry")
     geom.set("fill", "black")
     geom.set("stroke", "none")
+    def _copy_element(src, dst_parent):
+        """Append a deep-copied, namespace-stripped clone of src under dst_parent."""
+        local = etree.QName(src).localname
+        new = etree.SubElement(dst_parent, local)
+        for k, v in src.attrib.items():
+            new.set(etree.QName(k).localname, v)
+        if src.text:
+            new.text = src.text
+        for child in src:
+            _copy_element(child, new)
+
     for path_tag in trace.svg_paths:
-        # Each entry is a serialized "<path d='...' transform='...' fill='...'/>" string.
-        # Parse and reattach without namespace.
+        # Each entry is a serialized SVG snippet — usually a single
+        # "<path .../>", but snap_strokes emits "<g><line/><circle/></g>"
+        # when it needs asymmetric caps. Recursively reparent so the
+        # children of any wrapper element come along too.
         try:
             el = etree.fromstring(path_tag)
-            # strip namespace
-            local = etree.QName(el).localname
-            new = etree.SubElement(geom, local)
-            for k, v in el.attrib.items():
-                new.set(etree.QName(k).localname, v)
+            _copy_element(el, geom)
         except etree.XMLSyntaxError:
             # If parsing fails, treat as a raw `d` string
             p = etree.SubElement(geom, "path")
@@ -178,7 +189,12 @@ def assemble(trace: TraceResult,
             c.set("cx", f"{cx:.2f}")
             c.set("cy", f"{cy:.2f}")
             c.set("r", f"{r:.2f}")
-            c.set("stroke-width", f"{w + 1.0:.2f}")
+            # Subpixel sweep on the input asset showed `w - 0.5` (i.e.,
+            # -1.5 px relative to the prior `w + 1.0` constant) maximizes
+            # inside-ring SSIM. The previous overhang was tuned for
+            # cairosvg's AA edge under-coverage; resvg handles AA
+            # differently and prefers a slightly thinner stroke.
+            c.set("stroke-width", f"{w - 0.5:.2f}")
 
     # Text
     text_g = etree.SubElement(svg, "g")
@@ -195,6 +211,100 @@ def assemble(trace: TraceResult,
         ls_em = fm.letter_spacing_em if fm else 0.0
         dx = fm.dx if fm else 0.0
         dy = fm.dy if fm else 0.0
+        # ALGORITHMIC per-letter placement: when detection gave us arc
+        # params (cx, cy, r) and cap heights, compute each character's
+        # position from the chosen TEXT + FONT using natural advances.
+        # Works for any text length — the same arc/font params can be
+        # reused to regenerate the badge with different text.
+        if (dt.letter_anchors and dt.baseline and dt.baseline.kind == "arc"
+                and fm and fm.ttf_path):
+            a0 = dt.letter_anchors[0]
+            cx, cy, r, t0_b, t1_b = dt.baseline.params
+            t_center = (t0_b + t1_b) / 2.0
+            is_top = (a0["y"] < cy)
+            from . import geom as _geom_mod
+            text = dt.text or ""
+            caps = [a["cap_h"] for a in dt.letter_anchors]
+            # 0.8255 = 0.85 × 0.971; the 0.971 came from a subpixel SSIM
+            # sweep on the final pipeline output, picking the size that
+            # gives the best match against the original.
+            common_size = (float(sorted(caps)[len(caps) // 2]) / 0.72) * 0.8255
+            # Letter-spacing: t0_b/t1_b are the angles of the FIRST and
+            # LAST characters' CENTERS (from per-letter detection). The
+            # total text width must span CENTER-TO-CENTER of those, plus
+            # half the first char's advance on the left and half the last
+            # char's advance on the right (so the text envelope wraps
+            # around them).
+            #
+            #   |--w_first/2--|-center-to-center span-|--w_last/2--|
+            #   ^first char anchor             ^last char anchor
+            #
+            # center-to-center arc length = |t1 - t0| * r
+            # target total_w = center-to-center + (w_first + w_last) / 2
+            # letter_spacing = (target - natural_w) / n_pairs
+            from PIL import ImageFont as _ImageFont
+            _f = _ImageFont.truetype(fm.ttf_path, int(round(common_size)))
+            natural_w = float(_f.getlength(text))
+            w_first = float(_f.getlength(text[:1])) if text else 0.0
+            w_last = float(_f.getlength(text[-1:])) if text else 0.0
+            center_to_center_arc = abs(t1_b - t0_b) * r
+            target_total_w = center_to_center_arc + (w_first + w_last) / 2
+            n_pairs = max(len(text) - 1, 1)
+            letter_spacing_px = max(0.0, (target_total_w - natural_w) / n_pairs)
+            # Shift t_center to account for asymmetric first/last char
+            # widths. Derived from the two equations
+            #   t_first_anchor = t_center - total_w/(2r) + w_first/(2r)
+            #   t_last_anchor  = t_center + total_w/(2r) - w_last/(2r)
+            # summed gives t_center = midpoint + (w_last - w_first)/(4r)
+            # (NOT /2r — that was wrong by a factor of 2 and shifted the
+            # text twice as far as needed when first/last had different
+            # advances, e.g. "2" vs "5" in 2025).
+            t_center_shift = (w_last - w_first) / (4 * r)
+            t_center_corr = t_center + (t_center_shift if is_top else -t_center_shift)
+            placements = _geom_mod.place_text_on_arc(
+                text, fm.ttf_path, common_size,
+                cx, cy + dy, r, t_center_corr, is_top=is_top,
+                letter_spacing_px=letter_spacing_px,
+            )
+            if placements:
+                # PER-CHARACTER REFINEMENT: small dx/dy sweep around each
+                # algorithm-computed position, maximizing IoU within the
+                # original letter's mask. Size and rotation stay locked
+                # (algorithm provides those). Sweep is bounded to ±10 px
+                # so a stable algorithmic placement isn't undone by mask
+                # noise. Skipped if img_bgr isn't passed (e.g., regen
+                # from saved arc params without a reference image).
+                if img_bgr is not None:
+                    anchors_by_char_idx = list(dt.letter_anchors)  # 1:1 with placements
+                    for i, p in enumerate(placements):
+                        if i >= len(anchors_by_char_idx):
+                            break
+                        mask = anchors_by_char_idx[i].get("mask")
+                        if mask is None:
+                            continue
+                        best_x, best_y, best_rot, _ = _geom_mod.sweep_char_anchor(
+                            img_bgr, fm.ttf_path, common_size, p["char"],
+                            p["x"], p["y"], p["rot_deg"], mask,
+                            search_radius=10.0,
+                            rot_search_deg=2.0,
+                        )
+                        p["x"], p["y"] = best_x, best_y
+                        p["rot_deg"] = best_rot
+                for p in placements:
+                    ax, ay = p["x"] + dx, p["y"]
+                    t = etree.SubElement(text_g, "text")
+                    t.set("x", f"{ax:.2f}")
+                    t.set("y", f"{ay:.2f}")
+                    t.set("text-anchor", "middle")
+                    t.set("dominant-baseline", "central")
+                    t.set("fill", "black")
+                    t.set("font-family", family)
+                    t.set("font-weight", weight)
+                    t.set("font-size", f"{common_size:.2f}")
+                    t.set("transform",
+                          f"rotate({p['rot_deg']:.2f} {ax:.2f} {ay:.2f})")
+                    t.text = p["char"]
+                continue  # skip the textPath fallback below
         if dt.baseline and dt.baseline.kind == "arc":
             cx, cy, r, t0, t1 = dt.baseline.params
             # Apply optimiser dy as a vertical shift of the arc center
