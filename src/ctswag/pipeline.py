@@ -1,6 +1,7 @@
 """End-to-end pipeline runner."""
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +60,61 @@ class PipelineConfig:
     # vertical but vtracer's trace lands a few degrees off). Set to 0 to
     # disable. Only applies to inside-the-rings paths.
     vertical_snap_tolerance_deg: float = 8.0
+    # Hybrid tracer mode — how (if at all) to mix potrace into a primarily
+    # vtracer trace. Potrace's alphamax=0 keeps corners sharper than
+    # vtracer's splines, but it emits one giant compound `<path>` that's
+    # hard to edit shape-by-shape. The modes:
+    #   "off"               — vtracer only.
+    #   "mountains_overlay" — overlay potrace's mountain trace on top of
+    #                         vtracer's. Additive (only extends pixels);
+    #                         leaves each individual vtracer path editable.
+    #                         Visually negligible because vtracer already
+    #                         covers most of the same pixels.
+    #   "mountains_replace" — DROP vtracer paths whose bbox center sits in
+    #                         the mountain region; use potrace's compound
+    #                         trace there instead. Actually changes corner
+    #                         shape, sacrifices per-shape editability INSIDE
+    #                         the mountain region.
+    #   "inside_ring_replace" — same as "mountains_replace" but the region
+    #                         is the entire interior of the OUTER ring,
+    #                         capturing everything inside the badge
+    #                         (mountains, snowcaps, sunrays, comb teeth,
+    #                         central sun). Note: snap-emitted <line>s
+    #                         whose center falls in the region are dropped
+    #                         and replaced by potrace's filled traces, so
+    #                         the comb-tooth snap structure is sacrificed.
+    #                         The Nourd title text fitting outside the
+    #                         outer ring is preserved (it's <text>, not
+    #                         a traced path).
+    #   "all"               — equivalent to setting `tracer="potrace"`.
+    potrace_mode: str = "inside_ring_replace"
+    # Per-region alphamax for the inside_ring_replace potrace pass:
+    # the region is split at the horizon, with the upper part (mountains)
+    # using alpha_upper and the lower part (trees, comb teeth, sun base)
+    # using alpha_lower. alphamax=0 keeps every vertex sharp (polygonal
+    # curves), 1.0 is potrace's default per-corner heuristic, 1.3334 is
+    # max smoothing. Defaults from a 0.05-step sweep on the real reference.
+    potrace_alpha_upper: float = 1.0
+    potrace_alpha_lower: float = 1.0
+    # User-specified line segments (from the line editor frontend) that
+    # should be forced to render as crisp <line stroke-linecap="round"/>
+    # elements rather than approximated as part of potrace's compound path.
+    # Each entry: {"x1": float, "y1": float, "x2": float, "y2": float,
+    #              "stroke_width": float}.
+    # The pipeline paints those pixels white in residual_for_potrace so
+    # potrace doesn't re-trace them, then emits <line>s after potrace's
+    # output so they sit on top.
+    forced_lines: list[dict] | None = None
+    # The per-character IoU sweep in assemble.py refines each glyph's x/y/
+    # rotation against the ORIGINAL image's CC ink masks. That's correct
+    # only when the supplied text matches the ink that was detected (e.g.
+    # CAMP TINKER on a CAMP TINKER badge). For ARBITRARY user text on the
+    # same badge (LOREM IPSUM, etc.), each letter would try to snap to a
+    # mismatched mask — scrambling spacing and creating radial drift
+    # between adjacent letters. Set True to skip the sweep and rely
+    # purely on algorithmic placement from font advances. The configurator
+    # auto-enables this when the user changes the title or year.
+    skip_per_letter_sweep: bool = False
     # If provided, skip OCR entirely and assign these strings to detected
     # polygons in top-to-bottom order. Same length as expected polygon count.
     text_overrides: list[str] | None = None
@@ -67,6 +123,40 @@ class PipelineConfig:
     # None entries fall through to font-ID. Useful for debugging a specific
     # font hypothesis side-by-side with the auto-picked answer.
     font_overrides: list[tuple[str, int, str] | None] | None = None
+
+
+_PATH_NUM_RE = re.compile(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?')
+_TRANSLATE_RE = re.compile(
+    r'\btransform="\s*translate\(\s*(-?\d+\.?\d*)\s*[,\s]\s*(-?\d+\.?\d*)\s*\)')
+
+
+def _path_bbox_center(path_tag: str) -> tuple[float | None, float | None]:
+    """Cheap bbox center of an SVG `<path d="..."/>` (or `<line .../>`)
+    fragment, used to test whether a path falls inside a region mask.
+    Accounts for `transform="translate(tx,ty)"` (vtracer emits this on
+    every path). Treats every number in the `d` (or x1/x2/y1/y2) as a
+    coord; works for paths whose `d` doesn't use relative-move transforms.
+    Returns (None, None) if no numbers found."""
+    tx, ty = 0.0, 0.0
+    t_m = _TRANSLATE_RE.search(path_tag)
+    if t_m:
+        tx, ty = float(t_m.group(1)), float(t_m.group(2))
+    # <line .../> form
+    m_x1 = re.search(r'\bx1="([^"]+)"', path_tag)
+    m_y1 = re.search(r'\by1="([^"]+)"', path_tag)
+    m_x2 = re.search(r'\bx2="([^"]+)"', path_tag)
+    m_y2 = re.search(r'\by2="([^"]+)"', path_tag)
+    if m_x1 and m_y1 and m_x2 and m_y2:
+        return ((float(m_x1.group(1)) + float(m_x2.group(1))) / 2 + tx,
+                (float(m_y1.group(1)) + float(m_y2.group(1))) / 2 + ty)
+    m_d = re.search(r'\bd="([^"]+)"', path_tag)
+    if not m_d:
+        return None, None
+    nums = [float(x) for x in _PATH_NUM_RE.findall(m_d.group(1))]
+    if len(nums) < 2:
+        return None, None
+    xs = nums[0::2]; ys = nums[1::2]
+    return (min(xs) + max(xs)) / 2 + tx, (min(ys) + max(ys)) / 2 + ty
 
 
 def _crop_polygon(img: np.ndarray, polygon: np.ndarray,
@@ -91,6 +181,16 @@ def run(input_path: Path | str,
         *,
         badge=None) -> PipelineResult:
     """Run a full configuration end-to-end. Returns a PipelineResult."""
+    # eval.render_svg invokes resvg with `--use-fonts-dir $CTSWAG_FONTS_DIR`
+    # when set. resvg's @font-face data-URL support is partial — without
+    # the fonts dir it silently falls back to a system serif and our title
+    # text renders in the wrong typeface. Anchor it here so any caller that
+    # uses pipeline.run picks up the configured corpus automatically.
+    import os as _os
+    if "CTSWAG_FONTS_DIR" not in _os.environ:
+        corpus = Path(cfg.font_corpus_dir)
+        if corpus.exists():
+            _os.environ["CTSWAG_FONTS_DIR"] = str(corpus)
     timings: dict[str, float] = {}
     config_dump = {
         "detector": cfg.detector, "recognizer": cfg.recognizer,
@@ -396,6 +496,43 @@ def run(input_path: Path | str,
     inp_fn = inpaint_mod.REGISTRY[cfg.inpainter]
     mask = inpaint_mod.polygons_to_mask([dt.polygon for dt in texts], (H, W), inflate_px=4)
     residual = inp_fn(img_bgr, mask)
+    # Keep a copy with the INNER ring still intact, used by the potrace
+    # mountain-region pass: in the standard residual the inner ring gets
+    # painted white at step 4b, which truncates mountain ink ~2 px before
+    # the ring's inner edge and leaves a sub-pixel halo seam where peaks
+    # meet the ring. The potrace pass uses this variant so mountains
+    # extend seamlessly under the ring, and assemble's <circle> covers
+    # potrace's traced inner-ring band.
+    residual_for_potrace = residual.copy()
+    # Paint user-forced lines white in the potrace source so it doesn't
+    # re-trace them — they'll be re-emitted later as explicit <line> elements.
+    forced_line_svgs: list[str] = []
+    if cfg.forced_lines:
+        for ln in cfg.forced_lines:
+            x1, y1, x2, y2 = float(ln["x1"]), float(ln["y1"]), float(ln["x2"]), float(ln["y2"])
+            sw = float(ln.get("stroke_width", 12.0))
+            # Paint a band ~sw + 4 px wide so AA edges don't survive
+            cv2.line(
+                residual_for_potrace,
+                (int(round(x1)), int(round(y1))),
+                (int(round(x2)), int(round(y2))),
+                (255, 255, 255) if residual_for_potrace.ndim == 3 else 255,
+                thickness=int(round(sw + 4)),
+                lineType=cv2.LINE_AA,
+            )
+            # Also paint into `residual` so vtracer doesn't trace these either
+            cv2.line(
+                residual,
+                (int(round(x1)), int(round(y1))),
+                (int(round(x2)), int(round(y2))),
+                (255, 255, 255) if residual.ndim == 3 else 255,
+                thickness=int(round(sw + 4)),
+                lineType=cv2.LINE_AA,
+            )
+            forced_line_svgs.append(
+                f'<line x1="{x1:.2f}" y1="{y1:.2f}" '
+                f'x2="{x2:.2f}" y2="{y2:.2f}" stroke="black" '
+                f'stroke-width="{sw:.2f}" stroke-linecap="round" fill="none"/>')
     timings["inpaint"] = time.perf_counter() - t0
 
     # 4b. paint the rings white in the residual so vtracer doesn't re-trace
@@ -406,6 +543,10 @@ def run(input_path: Path | str,
     if found_circles:
         t0 = time.perf_counter()
         residual = circles_mod.paint_white(residual, found_circles, circle_widths)
+        # For the potrace pass: paint ONLY the outer ring white. Inner ring
+        # stays so mountain ink reaches it without a gap.
+        residual_for_potrace = circles_mod.paint_white(
+            residual_for_potrace, [found_circles[0]], [circle_widths[0]])
         outer_cx, outer_cy, outer_r = found_circles[0]
         outer_sw = circle_widths[0]
         yy_idx, xx_idx = np.mgrid[0:H, 0:W]
@@ -415,6 +556,13 @@ def run(input_path: Path | str,
             residual[outside_outer] = 255
         else:
             residual[outside_outer] = 255
+        # Same white-outside treatment for the potrace residual so anything
+        # past the outer ring (e.g. residual title-text ink that survived
+        # inpainting) doesn't bleed into potrace's compound trace.
+        if residual_for_potrace.ndim == 3:
+            residual_for_potrace[outside_outer] = 255
+        else:
+            residual_for_potrace[outside_outer] = 255
         timings["paint_rings"] = time.perf_counter() - t0
 
     # 5. trace -- either vtracer (filled Bezier contours) or skeleton-based
@@ -485,15 +633,165 @@ def run(input_path: Path | str,
                 horizon_y=horizon_y,
             )
             cv2.imwrite(str(out_dir / "snap_debug.png"), overlay)
+
+        # Sunray-ring bridge extensions: detect sunray angular positions
+        # and emit small radial <line>s that overlap the gap between
+        # vtracer's sunray ends and the clean inner-ring stroke. Run
+        # against the ORIGINAL grayscale (not residual — residual has
+        # had the ring painted white over it so sunray ends look short).
+        if len(found_circles) >= 1:
+            inner_idx = -1 if len(found_circles) > 1 else 0
+            inner_cx, inner_cy, inner_rad = found_circles[inner_idx]
+            inner_sw = circle_widths[inner_idx] if circle_widths else 19.5
+            gray_orig = (cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                         if img_bgr.ndim == 3 else img_bgr)
+            bridges = snap_strokes_mod.extend_sunrays_to_ring(
+                gray_orig, inner_cx, inner_cy, inner_rad, inner_sw)
+            if bridges:
+                trace = TraceResult(
+                    svg_paths=list(trace.svg_paths) + bridges,
+                    width=trace.width, height=trace.height,
+                )
+
+        # Hybrid potrace pass — see PipelineConfig.potrace_mode docstring.
+        if (cfg.potrace_mode not in ("off", "all")
+                and len(found_circles) >= 1):
+            # The INNER ring bounds the badge content (mountains, snowcaps,
+            # comb teeth, central sun); the OUTER ring bounds the title-text
+            # band on top of that. For "inside_ring_replace" we want the
+            # ENTIRE badge interior, so we use the OUTER ring as the region.
+            # For mountain-only modes we still anchor to the inner ring
+            # because mountains stop at the inner edge.
+            inner_idx = -1 if len(found_circles) > 1 else 0
+            outer_idx = 0
+            inner_cx, inner_cy, inner_rad = found_circles[inner_idx]
+            outer_cx, outer_cy, outer_rad = found_circles[outer_idx]
+            inner_sw = circle_widths[inner_idx] if circle_widths else 19.5
+            outer_sw = circle_widths[outer_idx] if circle_widths else 19.5
+            yy_m, xx_m = np.mgrid[0:H, 0:W]
+            dist_inner = np.hypot(xx_m - inner_cx, yy_m - inner_cy)
+            dist_outer = np.hypot(xx_m - outer_cx, yy_m - outer_cy)
+            inside_inner = dist_inner < inner_rad - (inner_sw / 2.0 + 2.0)
+            inside_outer = dist_outer < outer_rad - (outer_sw / 2.0 + 2.0)
+            if cfg.potrace_mode in ("mountains_overlay", "mountains_replace"):
+                if horizon_y is None:
+                    region = None
+                else:
+                    region = inside_inner & (yy_m < horizon_y - 1)
+            elif cfg.potrace_mode == "inside_ring_replace":
+                region = inside_outer
+            else:
+                raise ValueError(f"unknown potrace_mode: {cfg.potrace_mode!r}")
+
+            if region is not None and region.any():
+                # Source the potrace pass from the inner-ring-intact residual
+                # so mountain ink extends under the inner ring (the <circle>
+                # will paint over it). Fixes a sub-pixel halo seam where
+                # peaks meet the ring.
+                pt_source = residual_for_potrace
+
+                # Two potrace passes split at the horizon with independent
+                # alphamax: mountains (above) get cfg.potrace_alpha_upper,
+                # trees/comb teeth/sun base (below) get cfg.potrace_alpha_lower.
+                # 6 px overlap eliminates a seam at the horizon line.
+                pt_paths: list[str] = []
+                if (cfg.potrace_mode == "inside_ring_replace"
+                        and horizon_y is not None):
+                    upper = region & (yy_m < horizon_y + 6)
+                    lower = region & (yy_m >= horizon_y - 6)
+                    for sub_region, alpha in [
+                            (upper, cfg.potrace_alpha_upper),
+                            (lower, cfg.potrace_alpha_lower)]:
+                        if not sub_region.any():
+                            continue
+                        m = np.full_like(pt_source, 255)
+                        m[sub_region] = pt_source[sub_region]
+                        sub_tr = trace_mod.trace_potrace(
+                            m, turdsize=2, alphamax=alpha)
+                        pt_paths.extend(sub_tr.svg_paths)
+                else:
+                    masked = np.full_like(pt_source, 255)
+                    masked[region] = pt_source[region]
+                    pt_tr = trace_mod.trace_potrace(
+                        masked, turdsize=2, alphamax=cfg.potrace_alpha_upper)
+                    pt_paths = list(pt_tr.svg_paths)
+
+                if cfg.potrace_mode == "mountains_overlay":
+                    new_paths = list(trace.svg_paths) + pt_paths
+                else:
+                    # For inside_ring_replace: also drop vtracer fragments
+                    # whose center lands in the outer ring's stroke band.
+                    # paint_white intentionally leaves ~1 px of ring ink on
+                    # each side (to preserve line-art / ring overlap for
+                    # vtracer), but those leftover pixels get traced as a
+                    # ring of small AA fragments that visually appear as
+                    # gear teeth on the OUTSIDE of the <circle>. The
+                    # <circle> covers any real ring ink we'd lose, so the
+                    # drop is safe.
+                    if cfg.potrace_mode == "inside_ring_replace":
+                        drop_region = (dist_outer
+                                       < outer_rad + outer_sw / 2.0 + 2.0)
+                    else:
+                        drop_region = region
+                    # Split incoming trace into vtracer raw <path> fragments
+                    # (candidates for dropping) and snap-emitted <line>/<g>
+                    # elements (the cleaned horizon line, comb-tooth ticks,
+                    # sunray bridges — these have stroke-linecap="round" and
+                    # define our known horizontals/verticals; we never drop
+                    # them, and we emit them LAST so they paint over
+                    # potrace's polyline approximation of the same regions).
+                    kept_vtracer = []
+                    snap_elements = []
+                    for ps in trace.svg_paths:
+                        stripped = ps.lstrip()
+                        if not stripped.startswith('<path'):
+                            snap_elements.append(ps)
+                            continue
+                        cx, cy = _path_bbox_center(ps)
+                        if cx is None or cy is None:
+                            kept_vtracer.append(ps); continue
+                        cx_i = int(np.clip(cx, 0, W - 1))
+                        cy_i = int(np.clip(cy, 0, H - 1))
+                        if drop_region[cy_i, cx_i]:
+                            continue  # drop — covered by potrace + <circle>
+                        kept_vtracer.append(ps)
+                    new_paths = kept_vtracer + pt_paths + snap_elements
+
+                trace = TraceResult(svg_paths=new_paths,
+                                    width=trace.width, height=trace.height)
+
+        # Append user-forced <line>s LAST so they paint on top of everything.
+        if forced_line_svgs:
+            trace = TraceResult(
+                svg_paths=list(trace.svg_paths) + forced_line_svgs,
+                width=trace.width, height=trace.height)
+
         timings["snap_vertical"] = time.perf_counter() - t0
 
     out.trace = trace
 
     # 6. assemble
     t0 = time.perf_counter()
+    # Pass None for img_bgr when the per-letter sweep is disabled — the
+    # sweep is the only place assemble uses the reference image.
+    sweep_img = None if cfg.skip_per_letter_sweep else img_bgr
+    # Also zero out the optimizer-derived dx/dy/letter-spacing on each
+    # FontMatch: those values were swept by matching the rendered text
+    # against the IMAGE's ink, which is CAMP TINKER. For user text
+    # they're matching the wrong target, so they introduce a constant
+    # off-center shift in both per-letter and textPath emission.
+    if cfg.skip_per_letter_sweep:
+        cleaned = []
+        for m in matches:
+            d = m.__dict__.copy()
+            d["dx"] = 0.0
+            d["dy"] = 0.0
+            d["letter_spacing_em"] = 0.0
+            cleaned.append(type(m)(**d))
+        matches = cleaned
     assemble(trace, texts, matches, output_path=output_path,
              circles=found_circles, circle_widths=circle_widths,
-             img_bgr=img_bgr)
+             img_bgr=sweep_img)
     timings["assemble"] = time.perf_counter() - t0
     timings["total"] = sum(timings.values())
     return out

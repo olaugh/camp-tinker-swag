@@ -18,6 +18,7 @@ Strictly scoped:
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Iterable
 
@@ -296,6 +297,93 @@ def _trim_to_body(pts: np.ndarray, trim_ratio: float = 0.2) -> np.ndarray:
     return pts[keep]
 
 
+def extend_sunrays_to_ring(gray: np.ndarray,
+                            cx: float, cy: float,
+                            inner_r: float, inner_stroke: float,
+                            ) -> list[str]:
+    """Detect radial 'sunray' segments inside the inner ring and emit
+    bridge <line> elements that extend each sunray outward into the
+    ring stroke. Closes the white hairline halo between sunray ends and
+    the ring's inner edge that arises when the vtracer trace ends a
+    fraction of a pixel short.
+
+    Sampling at r = (inner-edge of ring - 3px) in the upper half (where
+    the sunrays live for this badge): every angular cluster of ink is
+    one sunray. Bridge line goes from `sample_r - 2` outward to
+    `inner_edge + 3`, overlapping both the sunray ink and the ring
+    stroke.
+    """
+    H, W = gray.shape[:2]
+    inner_edge = inner_r - inner_stroke / 2.0
+    sample_r = inner_edge - 3.0
+    if sample_r <= 0:
+        return []
+    angles = np.deg2rad(np.arange(-180.0, 0.0, 0.25))
+    ink = np.zeros(len(angles), dtype=bool)
+    for i, theta in enumerate(angles):
+        x = int(round(cx + sample_r * math.cos(theta)))
+        y = int(round(cy + sample_r * math.sin(theta)))
+        if 0 <= x < W and 0 <= y < H and gray[y, x] < 128:
+            ink[i] = True
+
+    # Group consecutive ink samples into rays (handle a small gap of ≤2
+    # samples = 0.5° as part of the same ray's AA jitter).
+    rays: list[tuple[float, float]] = []  # (theta_center, theta_width_rad)
+    i = 0
+    n = len(angles)
+    while i < n:
+        if not ink[i]:
+            i += 1
+            continue
+        j = i
+        gap = 0
+        while j < n - 1 and (ink[j + 1] or gap < 2):
+            if not ink[j + 1]:
+                gap += 1
+            else:
+                gap = 0
+            j += 1
+        # Strip trailing gap samples
+        while j > i and not ink[j]:
+            j -= 1
+        theta_center = float((angles[i] + angles[j]) / 2.0)
+        theta_width = float(angles[j] - angles[i])
+        rays.append((theta_center, theta_width))
+        i = j + 1
+
+    if not rays:
+        return []
+
+    # Bridge stroke = approximate ray pixel width at the sample radius.
+    # For Camp-Tinker-style sunrays, the angular widths are 0.5–1.5°
+    # and most rays cover ≈3-5 px at r≈580. Take the median width as
+    # the canonical bridge stroke (capped so it stays subtle).
+    widths_px = [max(2.0, w * sample_r) for _, w in rays if w > 0]
+    bridge_w = float(np.median(widths_px)) if widths_px else 4.0
+    bridge_w = min(bridge_w, 7.0)
+
+    out: list[str] = []
+    bridge_inner_r = sample_r - 2.0
+    # Bridge only covers the INNER edge of the ring (where the sunray
+    # ends + the ring's inner-side AA). Extending past the OUTER edge
+    # would overdraw the original's outer-edge AA fade and create new
+    # diff there. Cover ~5 px past the inner edge — enough to clear the
+    # inner-edge AA gradient.
+    bridge_outer_r = inner_edge + 5.0
+    for theta, _w in rays:
+        x1 = cx + bridge_inner_r * math.cos(theta)
+        y1 = cy + bridge_inner_r * math.sin(theta)
+        x2 = cx + bridge_outer_r * math.cos(theta)
+        y2 = cy + bridge_outer_r * math.sin(theta)
+        out.append(
+            f'<line x1="{x1:.2f}" y1="{y1:.2f}" '
+            f'x2="{x2:.2f}" y2="{y2:.2f}" '
+            f'stroke="black" stroke-width="{bridge_w:.2f}" '
+            f'fill="none" stroke-linecap="butt"/>'
+        )
+    return out
+
+
 def snap_vertical_below_horizon(
         svg_paths: Iterable[str],
         horizon_y: float,
@@ -502,7 +590,15 @@ def snap_vertical_below_horizon(
                             f'height="{kh:.2f}" '
                             f'fill="white" stroke="none"/>'
                         )
-                    out.append(("__SNAP__", tx_min, tx_max, horizon_y, ty_max,
+                    # Tooth top overlaps the horizon line by 3px so the
+                    # tooth's AA top edge lands on already-BLACK horizon
+                    # pixels (the horizon line covers y in [horizon_y -
+                    # median_w, horizon_y]). Without the overlap, the
+                    # tooth's AA top blends with the WHITE knockout
+                    # below the line and leaves a hairline gap.
+                    TOOTH_HORIZON_OVERLAP = 3.0
+                    out.append(("__SNAP__", tx_min, tx_max,
+                                horizon_y - TOOTH_HORIZON_OVERLAP, ty_max,
                                 True))  # top_flat for comb teeth
                     _record(bbox=(tx_min, horizon_y, tx_max, ty_max),
                             decision="snapped_comb_tooth",
@@ -597,21 +693,83 @@ def snap_vertical_below_horizon(
         return out
     median_w = float(np.median(widths))
     resolved: list[str] = []
+    # Comb-tooth snap lines (top_flat=True) emit LAST, after the horizon
+    # knockout/line, so they cover the gap right below horizon_y in their
+    # columns where the horizon knockout's bottom inset would otherwise
+    # punch through to white.
+    comb_tooth_lines: list[str] = []
     for item in out:
         if isinstance(item, tuple) and item[0] == "__SNAP__":
             _, sx_min, sx_max, sy_min, sy_max, top_flat = item
-            # Re-centre around the bbox-center x but force width to median_w.
             cx = (sx_min + sx_max) / 2.0
             sx_min2 = cx - median_w / 2.0
             sx_max2 = cx + median_w / 2.0
-            resolved.append(_emit_snapped_line(
+            line_svg = _emit_snapped_line(
                 sx_min2, sx_max2, sy_min, sy_max,
                 inner_circle=inner_circle,
                 ring_join_px=ring_join_px,
                 top_flat=top_flat,
-            ))
+            )
+            if top_flat:
+                comb_tooth_lines.append(line_svg)
+            else:
+                resolved.append(line_svg)
         else:
             resolved.append(item)
+
+    # Replace the wobbly vtracer trace of the mountain base with a CLEAN
+    # horizontal line. The original badge's horizon is perfectly straight,
+    # but vtracer's contour follows the rasterised edge and wobbles 1-2 px.
+    # Strategy: knock out the entire horizon band (white rect) to remove
+    # the wobbly trace, then draw a crisp <line> at horizon_y with the
+    # canonical stroke width on top. The knockout incidentally trims a
+    # few pixels off the bottoms of mountain silhouettes — which is fine,
+    # because those bottoms ARE the horizon and the clean line restores
+    # them at the right y.
+    if inner_circle is not None:
+        icx, icy, ir = inner_circle
+        # detect_horizon_y returns the BOTTOM EDGE of the line (Canny
+        # picks up the lower transition). The line CENTER sits half a
+        # stroke above. Without this correction the rendered line is
+        # offset down by half_w and visibly twice as thick where it
+        # overlaps the vtracer trace.
+        half_w = median_w / 2.0
+        line_cy = horizon_y - half_w
+        dy_ring = line_cy - icy
+        if abs(dy_ring) < ir:
+            half_chord = float(np.sqrt(ir * ir - dy_ring * dy_ring))
+            x_left = icx - half_chord
+            x_right = icx + half_chord
+            # Knockout band:
+            # - Top INSET by 1.5px below line_top so mountain ink (which
+            #   extends to ~line_top in the original) is preserved there
+            #   and blends with the line's top-edge AA. Without the
+            #   inset, the line's AA at y=line_top lands on white-from-
+            #   knockout and creates a visible seam between fully-black
+            #   mountain (above) and AA-light line top.
+            # - Bottom EXTENDED 2px below horizon_y so the wobbly vtracer
+            #   trace is fully erased. Comb-tooth lines emit last in the
+            #   z-stack and re-cover this band in their columns.
+            kpad_top = 1.5
+            kpad_bot = 2.0
+            knock_top = line_cy - half_w + kpad_top
+            knock_bot = line_cy + half_w + kpad_bot
+            resolved.append(
+                f'<rect x="{x_left:.2f}" y="{knock_top:.2f}" '
+                f'width="{(x_right - x_left):.2f}" '
+                f'height="{(knock_bot - knock_top):.2f}" '
+                f'fill="white" stroke="none"/>'
+            )
+            # Clean horizontal line at the canonical thickness.
+            resolved.append(
+                f'<line x1="{x_left:.2f}" y1="{line_cy:.2f}" '
+                f'x2="{x_right:.2f}" y2="{line_cy:.2f}" '
+                f'stroke="black" stroke-width="{median_w:.2f}" '
+                f'fill="none" stroke-linecap="butt"/>'
+            )
+    # Comb-tooth lines emit LAST so they cover the horizon-knockout's
+    # below-horizon extension in their columns, joining flush.
+    resolved.extend(comb_tooth_lines)
     return resolved
 
 

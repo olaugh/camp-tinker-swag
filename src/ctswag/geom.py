@@ -382,20 +382,27 @@ def place_text_on_arc(text: str, ttf_path: str, size_px: float,
     except Exception:
         return []
 
-    # Cumulative advance positions (text width up to and including i-th char).
-    # Apply uniform letter_spacing_px between consecutive characters so the
-    # algorithm can match hand-set designs whose tracking is wider than
-    # the font's natural advance width.
-    cumulative = [0.0]
+    # Per-character box centers in unwrapped text-line coords. Each char's
+    # box has width = its kerned advance (from cumulative diffs of
+    # font.getlength). Between consecutive boxes we add letter_spacing_px.
+    # The previous implementation added letter_spacing_px*i at the END of
+    # each cumulative position then used midpoints of adjacent cumulatives
+    # as centers — this made the FIRST gap shorter than the others by ls/2
+    # (e.g. "6767" rendered with three different gap sizes).
+    char_centers: list[float] = []
+    x = 0.0
+    prev_cum = 0.0
     for i in range(len(text)):
-        natural = float(font.getlength(text[: i + 1]))
-        cumulative.append(natural + letter_spacing_px * i)
-    total_w = cumulative[-1]
+        cum = float(font.getlength(text[: i + 1]))
+        advance = cum - prev_cum
+        prev_cum = cum
+        if i > 0:
+            x += letter_spacing_px
+        char_centers.append(x + advance / 2.0)
+        x += advance
+    total_w = x  # right edge of last char's box
     if total_w <= 0:
         return []
-
-    # Each character's center-x in unwrapped coords.
-    char_centers = [(cumulative[i] + cumulative[i + 1]) / 2 for i in range(len(text))]
     total_theta = total_w / arc_r
     # Direction of arc traversal as a function of unwrapped text x:
     #   top text: theta INCREASES from leftmost (small theta) to rightmost.

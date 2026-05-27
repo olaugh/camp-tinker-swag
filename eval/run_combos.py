@@ -86,6 +86,11 @@ def main():
     p.add_argument("--badge-synth", default=None,
                    help='When set to "Family:weight", also rebuilds the badge so '
                         'the "synth" detector can use ground-truth geometry.')
+    p.add_argument("--keep-input", action="store_true",
+                   help="With --badge-synth, build the SynthBadge in memory for "
+                        "ground-truth geometry but do NOT overwrite the input PNG. "
+                        "Use this when the input is a real raster you want to "
+                        "score against rather than the freshly synthesized badge.")
     p.add_argument("--fonts", default="fonts", type=Path)
     p.add_argument("--limit-combos", type=int, default=None,
                    help="If set, run only the first N combinations.")
@@ -125,9 +130,10 @@ def main():
         fam, _, wt = args.badge_synth.partition(":")
         weight = int(wt) if wt else 800
         badge = synthesize(font_family=fam, weight=weight, size=1024)
-        # write the regenerated badge to the expected path
-        args.input.parent.mkdir(parents=True, exist_ok=True)
-        args.input.write_bytes(badge.png_bytes)
+        if not args.keep_input:
+            # write the regenerated badge to the expected path
+            args.input.parent.mkdir(parents=True, exist_ok=True)
+            args.input.write_bytes(badge.png_bytes)
 
     detectors = args.detectors or detector_options()
     recognizers = args.recognizers or recognizer_options()

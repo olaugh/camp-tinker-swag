@@ -67,33 +67,41 @@ def trace_vtracer(img_bgr: np.ndarray, *,
     return TraceResult(svg_paths=_extract_paths(svg_text), width=W, height=H)
 
 
-def trace_potrace(img_bgr: np.ndarray, *, turdsize: int = 4, alphamax: float = 1.0) -> TraceResult:
+def trace_potrace(img_bgr: np.ndarray, *, turdsize: int = 2, alphamax: float = 0.0) -> TraceResult:
     """Pure-python potrace port (tatarize/potrace, GPL)."""
     try:
         import potracer as potrace  # the pure-python port
     except ImportError:
         import potrace  # fallback
     H, W = img_bgr.shape[:2]
-    gray = img_bgr.mean(axis=2)
-    bm = (gray < 128).astype(np.uint32)
-    bmp = potrace.Bitmap(bm)
+    # potracer's Bitmap thresholds non-bool arrays at 127.5 then unconditionally
+    # inverts, so passing a 0/1 mask produces all-True and traces the perimeter.
+    # Pass the raw uint8 grayscale; it does the right thing (white→bg, black→ink).
+    gray = img_bgr.mean(axis=2).astype(np.uint8)
+    bmp = potrace.Bitmap(gray)
     path = bmp.trace(turdsize=turdsize, alphamax=alphamax)
-    paths = []
+    # potrace returns nested curves (outer rings + inner holes). Combine
+    # into one compound path with fill-rule=evenodd so holes are knocked out.
+    parts: list[str] = []
     for curve in path:
-        d = []
         sp = curve.start_point
-        d.append(f"M {sp.x:.2f} {sp.y:.2f}")
+        parts.append(f"M {sp.x:.2f} {sp.y:.2f}")
         for seg in curve.segments:
             if seg.is_corner:
                 c = seg.c
                 e = seg.end_point
-                d.append(f"L {c.x:.2f} {c.y:.2f} L {e.x:.2f} {e.y:.2f}")
+                parts.append(f"L {c.x:.2f} {c.y:.2f} L {e.x:.2f} {e.y:.2f}")
             else:
                 c1 = seg.c1; c2 = seg.c2; e = seg.end_point
-                d.append(f"C {c1.x:.2f} {c1.y:.2f} {c2.x:.2f} {c2.y:.2f} {e.x:.2f} {e.y:.2f}")
-        d.append("Z")
-        paths.append(f'<path d="{" ".join(d)}" fill="black"/>')
-    return TraceResult(svg_paths=paths, width=W, height=H)
+                parts.append(f"C {c1.x:.2f} {c1.y:.2f} {c2.x:.2f} {c2.y:.2f} {e.x:.2f} {e.y:.2f}")
+        parts.append("Z")
+    if not parts:
+        return TraceResult(svg_paths=[], width=W, height=H)
+    d = " ".join(parts)
+    return TraceResult(
+        svg_paths=[f'<path d="{d}" fill="black" fill-rule="evenodd"/>'],
+        width=W, height=H,
+    )
 
 
 REGISTRY: dict[str, Tracer] = {

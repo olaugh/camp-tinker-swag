@@ -184,11 +184,16 @@ def assemble(trace: TraceResult,
         ring_g.set("fill", "none")
         ring_g.set("stroke", "black")
         widths = circle_widths or [6.0] * len(circles)
-        for (cx, cy, r), w in zip(circles, widths):
+        # Ring radius calibration (subpixel SSIM sweep). Outer ring: +0.2,
+        # inner ring: 0 (use detector's value). The sunray-ring junction
+        # is handled separately by snap_strokes.extend_sunrays_to_ring,
+        # not by tweaking the ring's radius.
+        r_deltas = [0.2 if i == 0 else 0.0 for i in range(len(circles))]
+        for ((cx, cy, r), w), dr in zip(zip(circles, widths), r_deltas):
             c = etree.SubElement(ring_g, "circle")
             c.set("cx", f"{cx:.2f}")
             c.set("cy", f"{cy:.2f}")
-            c.set("r", f"{r:.2f}")
+            c.set("r", f"{r + dr:.2f}")
             # Subpixel sweep on the input asset showed `w - 0.5` (i.e.,
             # -1.5 px relative to the prior `w + 1.0` constant) maximizes
             # inside-ring SSIM. The previous overhang was tuned for
@@ -259,8 +264,21 @@ def assemble(trace: TraceResult,
             # (NOT /2r — that was wrong by a factor of 2 and shifted the
             # text twice as far as needed when first/last had different
             # advances, e.g. "2" vs "5" in 2025).
-            t_center_shift = (w_last - w_first) / (4 * r)
-            t_center_corr = t_center + (t_center_shift if is_top else -t_center_shift)
+            # The asymmetric shift is only meaningful when first/last
+            # characters are intended to align with the DETECTED anchors
+            # (t0_b, t1_b). For arbitrary user text — signaled by
+            # img_bgr=None (caller has disabled the per-letter sweep) —
+            # we instead center the rendered text on the arc's natural
+            # apex: -π/2 for top text (visual top of the arc, directly
+            # above the arc center), +π/2 for bottom text. This is
+            # independent of where the original CAMP TINKER C/R anchors
+            # landed, so a renamed badge stays symmetric on the arc.
+            import math as _math
+            if img_bgr is not None:
+                t_center_shift = (w_last - w_first) / (4 * r)
+                t_center_corr = t_center + (t_center_shift if is_top else -t_center_shift)
+            else:
+                t_center_corr = -_math.pi / 2 if is_top else _math.pi / 2
             placements = _geom_mod.place_text_on_arc(
                 text, fm.ttf_path, common_size,
                 cx, cy + dy, r, t_center_corr, is_top=is_top,
@@ -349,6 +367,39 @@ def assemble(trace: TraceResult,
             if ls_em:
                 t.set("letter-spacing", f"{ls_em * float(size):.2f}")
             t.text = dt.text
+
+    # Unify stroke widths across the whole drawing. The source badge has
+    # consistent line thickness throughout (rings, snap lines, etc.), but
+    # the detectors estimate each one independently and produce widths
+    # that drift by a fraction of a px. A subpixel sweep on a real input
+    # showed forcing the median onto everything bumps inside-ring SSIM
+    # ~+0.0003 over per-element widths.
+    stroke_widths: list[float] = []
+    for el in svg.iter():
+        sw_attr = el.get("stroke-width")
+        if sw_attr is None:
+            continue
+        try:
+            stroke_widths.append(float(sw_attr))
+        except ValueError:
+            pass
+    if stroke_widths:
+        # Only unify "primary" strokes (rings, snap-line ticks, horizon —
+        # all in the same ~19 px range). Skip thin auxiliary strokes like
+        # sunray bridges, which are intentionally narrower than the main
+        # geometry's line weight.
+        primary = [w for w in stroke_widths if w > 10.0]
+        if primary:
+            median_w = float(sorted(primary)[len(primary) // 2])
+            for el in svg.iter():
+                sw_attr = el.get("stroke-width")
+                if sw_attr is None:
+                    continue
+                try:
+                    if float(sw_attr) > 10.0:
+                        el.set("stroke-width", f"{median_w:.2f}")
+                except ValueError:
+                    pass
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
